@@ -1,0 +1,30 @@
+{
+  "name": "llm-chat",
+  "displayName": "LLM-CHAT",
+  "description": "Lokaler Ollama Chat direkt in VS Code",
+  "version": "1.0.0",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "llm-chat-container",
+          "title": "LLM-CHAT",
+          "icon": "icons/chat.svg"
+        }
+      ]
+    },
+    "views": {
+      "llm-chat-container": [
+        {
+          "type": "webview",
+          "id": "llmChatView",
+          "name": "LLM-CHAT"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,6 @@
+requests
+rich
+pyside6
+mysql-connector-python
+fastapi
+uvicorn[standard]
