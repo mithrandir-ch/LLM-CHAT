@@ -1,75 +1,311 @@
+'use strict';
 const vscode = require('vscode');
-const { spawn } = require('child_process');
-const path = require('path');
-const fs = require('fs');
+const http   = require('http');
+const https  = require('https');
+const fs     = require('fs');
+const path   = require('path');
+const crypto = require('crypto');
 
-const SERVER_PORT = 8765;
-let serverProcess = null;
+// ── Config ────────────────────────────────────────────────────────────────
+const OLLAMA_DEFAULT = 'http://192.168.1.146:11434';
+let   ollamaHost     = OLLAMA_DEFAULT;
+let   sessionsDir    = '';
+let   log            = console.log;
 
-function startServer(projectRoot) {
-    if (serverProcess) return;
-    const serverPath = path.join(projectRoot, 'server.py');
-    serverProcess = spawn('python3', [serverPath], {
-        cwd: projectRoot,
-        stdio: ['ignore', 'pipe', 'pipe']
+function readEnv(root) {
+    try {
+        const lines = fs.readFileSync(path.join(root, '.env'), 'utf8').split('\n');
+        for (const l of lines) {
+            const m = l.match(/^\s*OLLAMA_HOST\s*=\s*(.+?)\s*$/);
+            if (m) { ollamaHost = m[1]; log(`[llm-chat] OLLAMA_HOST=${ollamaHost}`); }
+        }
+    } catch { /* .env optional */ }
+}
+
+// ── HTTP ──────────────────────────────────────────────────────────────────
+function get(url) {
+    return new Promise((ok, fail) => {
+        const u   = new URL(url);
+        const lib = u.protocol === 'https:' ? https : http;
+        const req = lib.get(url, res => {
+            let d = '';
+            res.on('data', c => d += c);
+            res.on('end', () => { try { ok(JSON.parse(d)); } catch { ok(d); } });
+        });
+        req.on('error', fail);
+        req.setTimeout(6000, () => { req.destroy(); fail(new Error('Timeout')); });
     });
-    serverProcess.stdout.on('data', d => console.log('[LLM-CHAT server]', d.toString().trim()));
-    serverProcess.stderr.on('data', d => console.error('[LLM-CHAT server]', d.toString().trim()));
-    serverProcess.on('exit', () => { serverProcess = null; });
 }
 
-function stopServer() {
-    if (serverProcess) {
-        serverProcess.kill();
-        serverProcess = null;
-    }
+function post(url, body, onLine, onEnd, onErr) {
+    const u   = new URL(url);
+    const lib = u.protocol === 'https:' ? https : http;
+    const bs  = JSON.stringify(body);
+    const req = lib.request(
+        { hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
+          path: u.pathname, method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bs) } },
+        res => {
+            let buf = '';
+            res.on('data', chunk => {
+                buf += chunk.toString();
+                const lines = buf.split('\n'); buf = lines.pop();
+                for (const ln of lines) { if (ln.trim()) try { onLine(JSON.parse(ln)); } catch {} }
+            });
+            res.on('end', onEnd);
+        }
+    );
+    req.on('error', onErr);
+    req.write(bs); req.end();
 }
 
-class LlmChatViewProvider {
-    constructor(extensionUri, projectRoot) {
-        this._extensionUri = extensionUri;
-        this._projectRoot = projectRoot;
-    }
+// ── Ollama ────────────────────────────────────────────────────────────────
+async function getModels() {
+    const data = await get(`${ollamaHost}/api/tags`);
+    return (data.models || [])
+        .filter(m => !m.name.toLowerCase().includes('embed') &&
+                     !['bert', 'nomic-bert'].includes(m.details?.family))
+        .map(m => m.name);
+}
 
-    resolveWebviewView(webviewView) {
-        startServer(this._projectRoot);
+// ── Sessions ──────────────────────────────────────────────────────────────
+const sessionFile = id => path.join(sessionsDir, `${id}.json`);
 
-        webviewView.webview.options = {
+function ensureDir() {
+    if (!fs.existsSync(sessionsDir)) fs.mkdirSync(sessionsDir, { recursive: true });
+}
+
+function listSessions() {
+    ensureDir();
+    return fs.readdirSync(sessionsDir)
+        .filter(f => f.endsWith('.json'))
+        .map(f => { try { const s = JSON.parse(fs.readFileSync(path.join(sessionsDir, f), 'utf8')); return { id: s.id, name: s.name, created_at: s.created_at }; } catch { return null; } })
+        .filter(Boolean)
+        .sort((a, b) => a.created_at.localeCompare(b.created_at));
+}
+
+function readSession(id) {
+    return JSON.parse(fs.readFileSync(sessionFile(id), 'utf8'));
+}
+
+function writeSession(s) {
+    ensureDir();
+    fs.writeFileSync(sessionFile(s.id), JSON.stringify(s, null, 2));
+}
+
+function createSession(name, model, sys) {
+    const s = {
+        id: crypto.randomBytes(4).toString('hex'),
+        name: name || 'Chat',
+        model: model || '',
+        created_at: new Date().toISOString(),
+        messages: sys ? [{ role: 'system', content: sys }] : []
+    };
+    writeSession(s); return s;
+}
+
+function deleteSession(id) {
+    const p = sessionFile(id);
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+}
+
+// ── Webview HTML ──────────────────────────────────────────────────────────
+function buildHtml(webview, extUri) {
+    const nonce  = crypto.randomBytes(16).toString('base64');
+    const jsUri  = webview.asWebviewUri(vscode.Uri.joinPath(extUri, 'chat.js'));
+    const csp    = [
+        `default-src 'none'`,
+        `style-src 'unsafe-inline'`,
+        `script-src 'nonce-${nonce}'`,
+    ].join('; ');
+
+    return `<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="${csp}">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--vscode-font-family,system-ui);font-size:13px;color:var(--vscode-foreground);background:var(--vscode-sideBar-background);display:flex;flex-direction:column;height:100vh;overflow:hidden}
+#bar{display:flex;align-items:center;gap:6px;padding:6px 8px;background:var(--vscode-editorGroupHeader-tabsBackground);border-bottom:1px solid var(--vscode-panel-border);flex-shrink:0}
+select{flex:1;background:var(--vscode-dropdown-background);color:var(--vscode-dropdown-foreground);border:1px solid var(--vscode-dropdown-border);border-radius:3px;padding:3px 6px;font-size:12px}
+#stats{font-size:10px;color:var(--vscode-descriptionForeground);white-space:nowrap}
+#tabs-wrap{display:flex;align-items:center;border-bottom:1px solid var(--vscode-panel-border);flex-shrink:0}
+#tabs{display:flex;flex:1;overflow-x:auto;padding:2px 4px;gap:2px;scrollbar-width:none}
+#tabs::-webkit-scrollbar{display:none}
+.tab{display:flex;align-items:center;gap:3px;padding:2px 8px 2px 10px;border-radius:3px;cursor:pointer;font-size:11px;white-space:nowrap;color:var(--vscode-tab-inactiveForeground)}
+.tab:hover{background:var(--vscode-list-hoverBackground)}
+.tab.on{background:var(--vscode-list-activeSelectionBackground);color:var(--vscode-list-activeSelectionForeground)}
+.tab button{background:none;border:none;color:inherit;cursor:pointer;font-size:10px;opacity:0;padding:0 2px}
+.tab:hover button,.tab.on button{opacity:.6}.tab button:hover{opacity:1!important}
+#btn-new{background:none;border:none;color:var(--vscode-foreground);cursor:pointer;font-size:16px;padding:0 8px;opacity:.6;flex-shrink:0}
+#btn-new:hover{opacity:1}
+#chat{flex:1;overflow-y:auto;padding:12px 10px;display:flex;flex-direction:column;gap:10px}
+.msg{display:flex;flex-direction:column;gap:2px}
+.lbl{font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;opacity:.5;padding:0 4px}
+.bbl{padding:8px 12px;border-radius:8px;line-height:1.55;word-break:break-word}
+.msg.user{align-items:flex-end}
+.msg.user .lbl{color:#4fc3f7}
+.msg.user .bbl{background:var(--vscode-button-background);color:var(--vscode-button-foreground);border-radius:10px 10px 2px 10px;max-width:90%}
+.msg.ai .lbl{color:#81c784}
+.msg.ai .bbl{background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);border:1px solid var(--vscode-panel-border);border-radius:2px 10px 10px 10px}
+.msg.sys .bbl{color:var(--vscode-descriptionForeground);font-size:11px;font-style:italic;text-align:center;padding:4px}
+.bbl p{margin:0 0 6px}.bbl p:last-child{margin:0}
+.bbl h1,.bbl h2,.bbl h3{margin:6px 0 3px;font-weight:600}
+.bbl code{font-family:monospace;font-size:11.5px;background:rgba(128,128,128,.18);padding:1px 4px;border-radius:3px}
+.bbl strong{font-weight:600}.bbl em{font-style:italic}
+.bbl ul,.bbl ol{padding-left:18px;margin:3px 0}.bbl li{margin:1px 0}
+.cb{margin:6px 0;border-radius:5px;overflow:hidden;border:1px solid var(--vscode-panel-border)}
+.cb-lang{display:block;font-size:10px;padding:3px 10px;color:var(--vscode-descriptionForeground);font-family:monospace;background:rgba(0,0,0,.2);border-bottom:1px solid var(--vscode-panel-border)}
+.cb pre{margin:0;padding:8px 12px;overflow-x:auto}
+.cb code{font-size:12px;background:transparent;padding:0;white-space:pre}
+#typing{display:none;align-items:center;gap:4px;padding:0 12px 6px;flex-shrink:0}
+#typing.on{display:flex}
+#typing span{width:5px;height:5px;border-radius:50%;background:var(--vscode-descriptionForeground);animation:blink 1.2s infinite ease-in-out}
+#typing span:nth-child(2){animation-delay:.15s}#typing span:nth-child(3){animation-delay:.3s}
+@keyframes blink{0%,80%,100%{transform:scale(.6);opacity:.3}40%{transform:scale(1);opacity:1}}
+#input-row{display:flex;gap:6px;padding:8px;border-top:1px solid var(--vscode-panel-border);background:var(--vscode-editorGroupHeader-tabsBackground);flex-shrink:0;align-items:flex-end}
+textarea{flex:1;min-height:32px;max-height:110px;resize:none;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:5px;padding:6px 10px;font-family:inherit;font-size:13px;line-height:1.4}
+textarea:focus{outline:none;border-color:var(--vscode-focusBorder)}
+#send{width:30px;height:30px;flex-shrink:0;border-radius:6px;border:none;background:var(--vscode-button-background);color:var(--vscode-button-foreground);cursor:pointer;font-size:16px}
+#send:hover{background:var(--vscode-button-hoverBackground)}
+#send:disabled{opacity:.35;cursor:not-allowed}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--vscode-scrollbarSlider-background);border-radius:2px}
+</style>
+</head>
+<body>
+<div id="bar">
+  <select id="model"><option>Lädt…</option></select>
+  <span id="stats"></span>
+</div>
+<div id="tabs-wrap">
+  <div id="tabs"></div>
+  <button id="btn-new" title="Neue Session">＋</button>
+</div>
+<div id="new-form" style="display:none;flex-direction:column;gap:4px;padding:6px 8px;border-bottom:1px solid var(--vscode-panel-border);background:var(--vscode-editorGroupHeader-tabsBackground)">
+  <input id="new-name" type="text" placeholder="Session-Name" style="background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:3px;padding:4px 8px;font-size:12px;width:100%">
+  <input id="new-sys" type="text" placeholder="System-Prompt (optional)" style="background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:3px;padding:4px 8px;font-size:12px;width:100%">
+  <div style="display:flex;gap:4px">
+    <button id="new-ok"  style="flex:1;padding:4px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:3px;cursor:pointer;font-size:12px">Erstellen</button>
+    <button id="new-cancel" style="flex:1;padding:4px;background:var(--vscode-button-secondaryBackground,#3c3c3c);color:var(--vscode-button-secondaryForeground,#ccc);border:none;border-radius:3px;cursor:pointer;font-size:12px">Abbrechen</button>
+  </div>
+</div>
+<div id="chat">
+  <div id="msgs"></div>
+  <div id="typing"><span></span><span></span><span></span></div>
+</div>
+<div id="input-row">
+  <textarea id="txt" rows="1" placeholder="Nachricht… (Enter senden, Shift+Enter neue Zeile)"></textarea>
+  <button id="send">↑</button>
+</div>
+<script nonce="${nonce}" src="${jsUri}"></script>
+</body>
+</html>`;
+}
+
+// ── Provider ──────────────────────────────────────────────────────────────
+class ChatProvider {
+    constructor(extUri) { this._uri = extUri; }
+
+    async resolveWebviewView(view) {
+        log('[llm-chat] resolveWebviewView');
+
+        view.webview.options = {
             enableScripts: true,
-            localResourceRoots: [
-                vscode.Uri.joinPath(this._extensionUri, 'webview')
-            ]
+            localResourceRoots: [this._uri]
         };
 
-        const webviewDir = path.join(this._extensionUri.fsPath, 'webview');
-        const htmlPath = path.join(webviewDir, 'index.html');
-        let html = fs.readFileSync(htmlPath, 'utf8');
+        view.webview.html = buildHtml(view.webview, this._uri);
 
-        // Lokale Ressourcen-URIs ersetzen
-        const cssUri = webviewView.webview.asWebviewUri(
-            vscode.Uri.joinPath(this._extensionUri, 'webview', 'style.css')
-        );
-        const jsUri = webviewView.webview.asWebviewUri(
-            vscode.Uri.joinPath(this._extensionUri, 'webview', 'chat.js')
-        );
-        html = html.replace('{{CSS_URI}}', cssUri).replace('{{JS_URI}}', jsUri);
+        view.webview.onDidReceiveMessage(async msg => {
+            log(`[llm-chat] ← ${msg.type}`);
 
-        webviewView.webview.html = html;
+            if (msg.type === 'ready') {
+                try {
+                    const [models, sessions] = await Promise.all([getModels(), Promise.resolve(listSessions())]);
+                    log(`[llm-chat] models: ${models}`);
+                    view.webview.postMessage({ type: 'init', models, sessions });
+                } catch (e) {
+                    log(`[llm-chat] init error: ${e.message}`);
+                    view.webview.postMessage({ type: 'init', models: [], sessions: [], error: e.message });
+                }
+                return;
+            }
+
+            if (msg.type === 'new-session') {
+                const s = createSession(msg.name, msg.model, msg.sys);
+                view.webview.postMessage({ type: 'session-created', session: s });
+                return;
+            }
+
+            if (msg.type === 'load-session') {
+                try {
+                    const s = readSession(msg.id);
+                    view.webview.postMessage({ type: 'session-loaded', session: s });
+                } catch (e) {
+                    view.webview.postMessage({ type: 'err', rid: msg.rid, msg: e.message });
+                }
+                return;
+            }
+
+            if (msg.type === 'delete-session') {
+                deleteSession(msg.id);
+                view.webview.postMessage({ type: 'session-deleted', id: msg.id });
+                return;
+            }
+
+            if (msg.type === 'chat') {
+                let session;
+                try { session = readSession(msg.sessionId); }
+                catch (e) { view.webview.postMessage({ type: 'chat-error', rid: msg.rid, msg: e.message }); return; }
+
+                session.messages.push({ role: 'user', content: msg.text });
+                writeSession(session);
+
+                let full = '';
+                post(
+                    `${ollamaHost}/api/chat`,
+                    { model: msg.model, messages: session.messages, stream: true },
+                    obj => {
+                        const t = obj.message?.content || '';
+                        if (t) { full += t; view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: t }); }
+                        if (obj.done) {
+                            session.messages.push({ role: 'assistant', content: full });
+                            writeSession(session);
+                            view.webview.postMessage({ type: 'chat-done', rid: msg.rid, tokens: obj.eval_count || 0, evalMs: obj.eval_duration || 0 });
+                        }
+                    },
+                    () => { if (!full) view.webview.postMessage({ type: 'chat-done', rid: msg.rid, tokens: 0, evalMs: 0 }); },
+                    e  => view.webview.postMessage({ type: 'chat-error', rid: msg.rid, msg: e.message })
+                );
+            }
+        });
     }
 }
 
-function activate(context) {
-    // Projektverzeichnis = eine Ebene über vscode-ext/
-    const projectRoot = path.join(context.extensionUri.fsPath, '..');
+// ── Activate ──────────────────────────────────────────────────────────────
+function activate(ctx) {
+    const out = vscode.window.createOutputChannel('LLM-CHAT');
+    out.show(true);
+    log = m => { out.appendLine(m); console.log(m); };
 
-    const provider = new LlmChatViewProvider(context.extensionUri, projectRoot);
-    context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider('llmChatView', provider)
+    const root    = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? ctx.extensionUri.fsPath;
+    sessionsDir   = path.join(root, 'sessions');
+    readEnv(root);
+
+    log(`[llm-chat] aktiviert | workspace: ${root} | ollama: ${ollamaHost}`);
+
+    const bar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    bar.text = '$(hubot) LLM-CHAT'; bar.tooltip = ollamaHost; bar.show();
+    ctx.subscriptions.push(bar, out);
+
+    // retainContextWhenHidden = true  ← KRITISCH: verhindert dass Webview beim Verstecken zerstört wird
+    ctx.subscriptions.push(
+        vscode.window.registerWebviewViewProvider('llmChatView', new ChatProvider(ctx.extensionUri), {
+            webviewOptions: { retainContextWhenHidden: true }
+        })
     );
 }
 
-function deactivate() {
-    stopServer();
-}
-
+function deactivate() {}
 module.exports = { activate, deactivate };

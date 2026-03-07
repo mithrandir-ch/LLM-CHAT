@@ -1,0 +1,23 @@
+# VSCode Extension
+vscode-ext/*.vsix
+vscode-ext/node_modules/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+venv/
+
+# Sessions (lokale Daten)
+sessions/
+
+# Environment
+.env
+
+# OS
+.DS_Store
+Thumbs.db
