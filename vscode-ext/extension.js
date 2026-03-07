@@ -1,10 +1,11 @@
 'use strict';
-const vscode = require('vscode');
-const http   = require('http');
-const https  = require('https');
-const fs     = require('fs');
-const path   = require('path');
-const crypto = require('crypto');
+const vscode  = require('vscode');
+const http    = require('http');
+const https   = require('https');
+const fs      = require('fs');
+const path    = require('path');
+const crypto  = require('crypto');
+const memory  = require('./memory');
 
 // ── Config ────────────────────────────────────────────────────────────────
 const OLLAMA_DEFAULT = 'http://192.168.1.146:11434';
@@ -13,13 +14,16 @@ let   sessionsDir    = '';
 let   log            = console.log;
 
 function readEnv(root) {
+    const env = {};
     try {
         const lines = fs.readFileSync(path.join(root, '.env'), 'utf8').split('\n');
         for (const l of lines) {
-            const m = l.match(/^\s*OLLAMA_HOST\s*=\s*(.+?)\s*$/);
-            if (m) { ollamaHost = m[1]; log(`[llm-chat] OLLAMA_HOST=${ollamaHost}`); }
+            const m = l.match(/^\s*([^#=]+?)\s*=\s*(.+?)\s*$/);
+            if (m) env[m[1].trim()] = m[2].trim();
         }
     } catch { /* .env optional */ }
+    if (env.OLLAMA_HOST)  { ollamaHost = env.OLLAMA_HOST; log(`[llm-chat] OLLAMA_HOST=${ollamaHost}`); }
+    return env;
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────
@@ -259,13 +263,28 @@ class ChatProvider {
                 try { session = readSession(msg.sessionId); }
                 catch (e) { view.webview.postMessage({ type: 'chat-error', rid: msg.rid, msg: e.message }); return; }
 
+                // ── Memory: relevante Erinnerungen als Kontext laden ──────
+                let messagesWithMemory = [...session.messages];
+                if (memory.isReady()) {
+                    const memCtx = await memory.buildMemoryContext(msg.text, msg.sessionId);
+                    if (memCtx) {
+                        log(`[memory] Kontext gefunden → injiziere`);
+                        // System-Message mit Erinnerungen vorne einsetzen (nach bestehendem System-Prompt)
+                        const sysIdx = messagesWithMemory.findIndex(m => m.role === 'system');
+                        const memMsg = { role: 'system', content: memCtx };
+                        if (sysIdx >= 0) messagesWithMemory.splice(sysIdx + 1, 0, memMsg);
+                        else             messagesWithMemory.unshift(memMsg);
+                    }
+                }
+
                 session.messages.push({ role: 'user', content: msg.text });
+                messagesWithMemory.push({ role: 'user', content: msg.text });
                 writeSession(session);
 
                 let full = '';
                 post(
                     `${ollamaHost}/api/chat`,
-                    { model: msg.model, messages: session.messages, stream: true },
+                    { model: msg.model, messages: messagesWithMemory, stream: true },
                     obj => {
                         const t = obj.message?.content || '';
                         if (t) { full += t; view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: t }); }
@@ -273,6 +292,11 @@ class ChatProvider {
                             session.messages.push({ role: 'assistant', content: full });
                             writeSession(session);
                             view.webview.postMessage({ type: 'chat-done', rid: msg.rid, tokens: obj.eval_count || 0, evalMs: obj.eval_duration || 0 });
+                            // ── Memory: Q+A asynchron speichern ──────────
+                            if (memory.isReady()) {
+                                memory.store(msg.sessionId, 'user',      msg.text).catch(e => log(`[memory] ${e.message}`));
+                                memory.store(msg.sessionId, 'assistant', full    ).catch(e => log(`[memory] ${e.message}`));
+                            }
                         }
                     },
                     () => { if (!full) view.webview.postMessage({ type: 'chat-done', rid: msg.rid, tokens: 0, evalMs: 0 }); },
@@ -291,9 +315,26 @@ function activate(ctx) {
 
     const root    = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? ctx.extensionUri.fsPath;
     sessionsDir   = path.join(root, 'sessions');
-    readEnv(root);
+    const env     = readEnv(root);
 
     log(`[llm-chat] aktiviert | workspace: ${root} | ollama: ${ollamaHost}`);
+
+    // ── Memory / MariaDB initialisieren ───────────────────────────────────
+    if (env.DB_HOST) {
+        memory.init({
+            ollamaHost,
+            embedModel: env.EMBEDDING_MODEL || 'nomic-embed-text',
+            dbHost:     env.DB_HOST,
+            dbPort:     parseInt(env.DB_PORT || '3306'),
+            dbUser:     env.DB_USER,
+            dbPass:     env.DB_PASS,
+            dbName:     env.DB_NAME,
+        }, m => { out.appendLine(m); console.log(m); }).then(ok => {
+            log(ok ? '[memory] Langzeitgedächtnis aktiv' : '[memory] Deaktiviert (kein DB-Zugang)');
+        });
+    } else {
+        log('[memory] Kein DB_HOST in .env — Memory deaktiviert');
+    }
 
     const bar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     bar.text = '$(hubot) LLM-CHAT'; bar.tooltip = ollamaHost; bar.show();

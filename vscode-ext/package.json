@@ -4,19 +4,41 @@
   "description": "Ollama Chat in VS Code",
   "version": "3.0.0",
   "publisher": "local",
-  "engines": { "vscode": "^1.85.0" },
-  "activationEvents": ["onStartupFinished"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./extension.js",
   "contributes": {
     "viewsContainers": {
       "activitybar": [
-        { "id": "llm-chat", "title": "LLM-CHAT", "icon": "icons/chat.svg" }
+        {
+          "id": "llm-chat",
+          "title": "LLM-CHAT",
+          "icon": "icons/chat.svg"
+        }
       ]
     },
     "views": {
       "llm-chat": [
-        { "type": "webview", "id": "llmChatView", "name": "Chat" }
+        {
+          "type": "webview",
+          "id": "llmChatView",
+          "name": "Chat"
+        }
       ]
     }
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "mysql2": "^3.19.0"
   }
 }
