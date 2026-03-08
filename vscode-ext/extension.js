@@ -18,6 +18,8 @@ let   searxngSafe    = 1;
 let   searxngMax     = 5;
 let   searxngEngines = '';
 let   webDefaultOn   = false;
+let   agentEnabled   = true;   // LLM-gesteuerter Agent-Loop mit Tool-Calling
+let   agentMaxSteps  = 6;      // Max. Suchschritte pro Anfrage
 let   osCmdEnabled   = false;
 let   osCmdTimeoutMs = 60000;
 let   osCmdMaxChars  = 12000;
@@ -74,6 +76,8 @@ function readEnv(root) {
     if (env.SEARXNG_MAX_RESULTS) searxngMax = clampInt(env.SEARXNG_MAX_RESULTS, 5, 1, 10);
     if (env.SEARXNG_ENGINES) searxngEngines = env.SEARXNG_ENGINES;
     if (env.WEB_SEARCH_DEFAULT) webDefaultOn = parseBool(env.WEB_SEARCH_DEFAULT, false);
+    if (env.AGENT_ENABLED)     agentEnabled  = parseBool(env.AGENT_ENABLED, true);
+    if (env.AGENT_MAX_STEPS)   agentMaxSteps = clampInt(env.AGENT_MAX_STEPS, 6, 1, 20);
     if (env.ALLOW_OS_COMMANDS) osCmdEnabled = parseBool(env.ALLOW_OS_COMMANDS, false);
     if (env.OS_CMD_TIMEOUT_MS) osCmdTimeoutMs = clampInt(env.OS_CMD_TIMEOUT_MS, 60000, 3000, 300000);
     if (env.OS_CMD_MAX_CHARS) osCmdMaxChars = clampInt(env.OS_CMD_MAX_CHARS, 12000, 1000, 120000);
@@ -134,6 +138,28 @@ function post(url, body, onLine, onEnd, onErr) {
     );
     req.on('error', onErr);
     req.write(bs); req.end();
+}
+
+// Non-streaming POST – für den Agent-Loop
+function postJson(url, body) {
+    return new Promise((ok, fail) => {
+        const u   = new URL(url);
+        const lib = u.protocol === 'https:' ? https : http;
+        const bs  = JSON.stringify(body);
+        const req = lib.request(
+            { hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
+              path: u.pathname, method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bs) } },
+            res => {
+                let d = '';
+                res.on('data', c => d += c);
+                res.on('end', () => { try { ok(JSON.parse(d)); } catch (e) { fail(new Error(`JSON: ${e.message}`)); } });
+            }
+        );
+        req.on('error', fail);
+        req.setTimeout(120000, () => { req.destroy(); fail(new Error('Agent-Timeout')); });
+        req.write(bs); req.end();
+    });
 }
 
 // ── Local OS Commands ─────────────────────────────────────────────────────
@@ -603,6 +629,102 @@ function buildWebContext(results) {
     ].join('\n');
 }
 
+// ── Agent Tool-Definitionen ────────────────────────────────────────────────
+const AGENT_TOOLS = [
+    {
+        type: 'function',
+        function: {
+            name: 'web_search',
+            description: 'Sucht im Internet nach aktuellen Informationen. Nutze dieses Tool für aktuelle Nachrichten, neue Technologien, aktuelle Fakten oder alles was nach deinem Trainings-Cutoff liegt. Du kannst mehrfach suchen um verschiedene Aspekte abzudecken.',
+            parameters: {
+                type: 'object',
+                required: ['query'],
+                properties: {
+                    query: {
+                        type: 'string',
+                        description: 'Die Suchanfrage — präzise und spezifisch formulieren'
+                    }
+                }
+            }
+        }
+    }
+];
+
+// ── Agent Loop ────────────────────────────────────────────────────────────
+/**
+ * ReAct-Agent: LLM entscheidet selbst wann und was es sucht.
+ * Gibt { messages, fullText, tokens, evalMs } zurück.
+ */
+async function runAgentLoop(model, messages, onStep) {
+    const agentMsgs = [...messages];
+    let steps = 0;
+
+    while (steps < agentMaxSteps) {
+        steps++;
+        const resp = await postJson(`${ollamaHost}/api/chat`, {
+            model,
+            messages: trimContext(agentMsgs),
+            tools:    AGENT_TOOLS,
+            stream:   false
+        });
+
+        const msg = resp.message;
+        if (!msg) throw new Error('Keine Antwort von Ollama');
+
+        const toolCalls = msg.tool_calls;
+        if (!toolCalls || toolCalls.length === 0) {
+            // Finale Antwort
+            return {
+                messages: agentMsgs,
+                fullText: msg.content || '',
+                tokens:   resp.eval_count   || 0,
+                evalMs:   resp.eval_duration || 0
+            };
+        }
+
+        // Tool-Aufruf verarbeiten
+        agentMsgs.push({ role: 'assistant', content: msg.content || '', tool_calls: toolCalls });
+
+        for (const tc of toolCalls) {
+            const name = tc.function?.name;
+            let   args = tc.function?.arguments || {};
+            if (typeof args === 'string') { try { args = JSON.parse(args); } catch {} }
+
+            if (name === 'web_search') {
+                const query = String(args.query || '').trim();
+                if (!query) continue;
+                onStep(`Suche ${steps}: "${query}"`);
+                log(`[agent] web_search(${steps}): ${query}`);
+                try {
+                    const res = await runWebSearch(query);
+                    const content = res.ok && res.results.length
+                        ? res.results.map((r, i) =>
+                            `${i + 1}. ${r.title}\nURL: ${r.url}\nSnippet: ${r.content || '-'}`
+                          ).join('\n\n')
+                        : 'Keine Treffer gefunden.';
+                    agentMsgs.push({ role: 'tool', content });
+                } catch (e) {
+                    agentMsgs.push({ role: 'tool', content: `Suche fehlgeschlagen: ${e.message}` });
+                }
+            }
+        }
+    }
+
+    // Max Steps erreicht → finale Antwort ohne Tools erzwingen
+    log(`[agent] Max Steps (${agentMaxSteps}) erreicht, fordere finale Antwort an`);
+    const final = await postJson(`${ollamaHost}/api/chat`, {
+        model,
+        messages: trimContext(agentMsgs),
+        stream:   false
+    });
+    return {
+        messages: agentMsgs,
+        fullText: final.message?.content || 'Keine Antwort.',
+        tokens:   final.eval_count   || 0,
+        evalMs:   final.eval_duration || 0
+    };
+}
+
 function injectSystemContext(messages, content) {
     let i = 0;
     while (i < messages.length && messages[i].role === 'system') i++;
@@ -760,6 +882,10 @@ select{flex:1;background:var(--vscode-dropdown-background);color:var(--vscode-dr
 .msg.ai .lbl{color:#81c784}
 .msg.ai .bbl{background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);border:1px solid var(--vscode-panel-border);border-radius:2px 10px 10px 10px}
 .msg.sys .bbl{color:var(--vscode-descriptionForeground);font-size:11px;font-style:italic;text-align:center;padding:4px}
+.msg.agent .bbl{color:var(--vscode-descriptionForeground);font-size:11px;font-style:italic;text-align:center;padding:4px;animation:agent-pulse 1.5s ease-in-out infinite}
+.agent-icon{display:inline-block;animation:agent-spin 2s linear infinite}
+@keyframes agent-spin{to{transform:rotate(360deg)}}
+@keyframes agent-pulse{0%,100%{opacity:.5}50%{opacity:1}}
 .bbl p{margin:0 0 6px}.bbl p:last-child{margin:0}
 .bbl h1,.bbl h2,.bbl h3{margin:6px 0 3px;font-weight:600}
 .bbl code{font-family:monospace;font-size:11.5px;background:rgba(128,128,128,.18);padding:1px 4px;border-radius:3px}
@@ -807,7 +933,16 @@ textarea:focus{outline:none;border-color:var(--vscode-focusBorder)}
 </div>
 <div id="new-form" style="display:none;flex-direction:column;gap:4px;padding:6px 8px;border-bottom:1px solid var(--vscode-panel-border);background:var(--vscode-editorGroupHeader-tabsBackground)">
   <input id="new-name" type="text" placeholder="Session-Name" style="background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:3px;padding:4px 8px;font-size:12px;width:100%">
-  <input id="new-sys" type="text" placeholder="System-Prompt (optional)" style="background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:3px;padding:4px 8px;font-size:12px;width:100%">
+  <select id="new-preset" style="background:var(--vscode-dropdown-background);color:var(--vscode-dropdown-foreground);border:1px solid var(--vscode-dropdown-border);border-radius:3px;padding:3px 6px;font-size:12px;width:100%">
+    <option value="">— Preset wählen (optional) —</option>
+    <option value="coding">🖥️ Coding Assistant</option>
+    <option value="research">🔬 Research / Analyst</option>
+    <option value="creative">✍️ Kreatives Schreiben</option>
+    <option value="translate">🌐 Übersetzer DE↔EN</option>
+    <option value="devops">⚙️ DevOps / Shell</option>
+    <option value="custom">✏️ Eigener Prompt</option>
+  </select>
+  <textarea id="new-sys" rows="4" placeholder="System-Prompt (optional)" style="background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:3px;padding:4px 8px;font-size:12px;width:100%;resize:vertical;font-family:inherit"></textarea>
   <div style="display:flex;gap:4px">
     <button id="new-ok"  style="flex:1;padding:4px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:3px;cursor:pointer;font-size:12px">Erstellen</button>
     <button id="new-cancel" style="flex:1;padding:4px;background:var(--vscode-button-secondaryBackground,#3c3c3c);color:var(--vscode-button-secondaryForeground,#ccc);border:none;border-radius:3px;cursor:pointer;font-size:12px">Abbrechen</button>
@@ -1062,60 +1197,55 @@ class ChatProvider {
                     view.webview.postMessage({ type: 'fs-inject', count: autoFsCount });
                 }
 
-                // ── Websuche (SearXNG) optional als zusätzlicher Kontext ──
-                if (msg.useWeb) {
-                    try {
-                        const search = await runWebSearch(msg.text);
-                        if (!search.ok) {
-                            view.webview.postMessage({
-                                type: 'web-status',
-                                rid: msg.rid,
-                                ok: false,
-                                msg: `Websuche nicht verfuegbar: ${search.error}`,
-                                hits: 0,
-                                host: search.host
-                            });
-                            log(`[web] nicht verfuegbar: ${search.error}`);
-                        } else if (search.hits > 0) {
-                            webSources = search.results;
-                            injectSystemContext(messagesWithMemory, buildWebContext(search.results));
-                            view.webview.postMessage({
-                                type: 'web-status',
-                                rid: msg.rid,
-                                ok: true,
-                                msg: `Websuche aktiv: ${search.hits} Treffer`,
-                                hits: search.hits,
-                                host: search.host
-                            });
-                            log(`[web] Treffer: ${search.hits} (${search.host})`);
-                        } else {
-                            view.webview.postMessage({
-                                type: 'web-status',
-                                rid: msg.rid,
-                                ok: false,
-                                msg: 'Websuche aktiv, aber keine Treffer gefunden',
-                                hits: 0,
-                                host: search.host
-                            });
-                            log('[web] keine Treffer');
-                        }
-                    } catch (e) {
-                        view.webview.postMessage({
-                            type: 'web-status',
-                            rid: msg.rid,
-                            ok: false,
-                            msg: `Websuche fehlgeschlagen: ${e.message}`,
-                            hits: 0,
-                            host: searxngUrl || '-'
-                        });
-                        log(`[web] Fehler: ${e.message}`);
-                    }
-                }
-
                 session.messages.push({ role: 'user', content: msg.text });
                 messagesWithMemory.push({ role: 'user', content: msg.text });
                 writeSession(session);
 
+                // ── Agent-Loop (wenn Web aktiv + Agent aktiviert + SearXNG konfiguriert) ──
+                if (msg.useWeb && agentEnabled && webSearchConfigured()) {
+                    view.webview.postMessage({ type: 'agent-step', rid: msg.rid, text: 'Agent denkt nach…' });
+                    try {
+                        const result = await runAgentLoop(
+                            msg.model,
+                            messagesWithMemory,
+                            stepText => view.webview.postMessage({ type: 'agent-step', rid: msg.rid, text: stepText })
+                        );
+                        const full = result.fullText;
+                        view.webview.postMessage({ type: 'chunk',     rid: msg.rid, text: full });
+                        view.webview.postMessage({ type: 'chat-done', rid: msg.rid, tokens: result.tokens, evalMs: result.evalMs });
+                        session.messages.push({ role: 'assistant', content: full });
+                        writeSession(session);
+                        if (memory.isReady()) {
+                            memory.store(msg.sessionId, 'user',      msg.text).catch(e => log(`[memory] ${e.message}`));
+                            memory.store(msg.sessionId, 'assistant', full    ).catch(e => log(`[memory] ${e.message}`));
+                        }
+                    } catch (e) {
+                        log(`[agent] Fehler: ${e.message}`);
+                        view.webview.postMessage({ type: 'chat-error', rid: msg.rid, msg: e.message });
+                    }
+                    return;
+                }
+
+                // ── Klassische Websuche (Agent aus oder kein SearXNG) ─────────────────
+                if (msg.useWeb) {
+                    try {
+                        const search = await runWebSearch(msg.text);
+                        if (search.ok && search.hits > 0) {
+                            webSources = search.results;
+                            injectSystemContext(messagesWithMemory, buildWebContext(search.results));
+                            view.webview.postMessage({ type: 'web-status', rid: msg.rid, ok: true,
+                                msg: `Websuche: ${search.hits} Treffer`, hits: search.hits, host: search.host });
+                        } else {
+                            view.webview.postMessage({ type: 'web-status', rid: msg.rid, ok: false,
+                                msg: search.ok ? 'Keine Treffer' : `Websuche: ${search.error}`, hits: 0, host: search.host });
+                        }
+                    } catch (e) {
+                        view.webview.postMessage({ type: 'web-status', rid: msg.rid, ok: false,
+                            msg: `Websuche fehlgeschlagen: ${e.message}`, hits: 0, host: searxngUrl || '-' });
+                    }
+                }
+
+                // ── Standard Ollama-Streaming ──────────────────────────────────────────
                 let full = '';
                 post(
                     `${ollamaHost}/api/chat`,
@@ -1125,10 +1255,8 @@ class ChatProvider {
                         if (t) { full += t; view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: t }); }
                         if (obj.done) {
                             if (webSources.length > 0 && !/quellen\s*:/i.test(full)) {
-                                const src = webSources
-                                    .slice(0, 3)
-                                    .map((r, i) => `${i + 1}. ${r.title} - ${r.url}`)
-                                    .join('\n');
+                                const src = webSources.slice(0, 3)
+                                    .map((r, i) => `${i + 1}. ${r.title} - ${r.url}`).join('\n');
                                 const appendix = `\n\nQuellen:\n${src}`;
                                 full += appendix;
                                 view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: appendix });
@@ -1136,7 +1264,6 @@ class ChatProvider {
                             session.messages.push({ role: 'assistant', content: full });
                             writeSession(session);
                             view.webview.postMessage({ type: 'chat-done', rid: msg.rid, tokens: obj.eval_count || 0, evalMs: obj.eval_duration || 0 });
-                            // ── Memory: Q+A asynchron speichern ──────────
                             if (memory.isReady()) {
                                 memory.store(msg.sessionId, 'user',      msg.text).catch(e => log(`[memory] ${e.message}`));
                                 memory.store(msg.sessionId, 'assistant', full    ).catch(e => log(`[memory] ${e.message}`));

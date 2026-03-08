@@ -26,7 +26,8 @@ window.addEventListener('message', ({ data: m }) => {
         case 'chat-error': { const s = streams[m.rid]; if (s) { s.error(m.msg); delete streams[m.rid]; } break; }
         case 'status-result': onStatusResult(m); break;
         case 'web-status': onWebStatus(m); break;
-        case 'fs-inject':  sysMsg(`Datei-Kontext geladen (${m.count} Pfad${m.count > 1 ? 'e' : ''})`); break;
+        case 'fs-inject':   sysMsg(`Datei-Kontext geladen (${m.count} Pfad${m.count > 1 ? 'e' : ''})`); break;
+        case 'agent-step':  onAgentStep(m.text); break;
     }
 });
 
@@ -135,13 +136,33 @@ function renderTabs() {
     el.querySelector('.on')?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
 }
 
+// ── Preset-Texte ───────────────────────────────────────────────────────────
+const PRESETS = {
+    coding:    'Du bist ein erfahrener Software-Entwickler.\n- Erkläre zuerst den Ansatz, dann schreibe Code.\n- Code immer in Fenced-Blocks mit Sprach-Tag.\n- Antworte auf Deutsch.',
+    research:  'Du bist ein präziser Recherche-Assistent.\n- Trenne klar zwischen Fakten, Schlussfolgerungen und Spekulation.\n- Strukturiere Antworten mit Markdown-Headers.\n- Wenn du unsicher bist, sage es explizit.',
+    creative:  'Du bist ein kreativer Schreibhelfer.\n- Passe dich dem Stil und Ton des Nutzers an.\n- Mache Vorschläge, aber lasse die Stimme des Nutzers zentral.\n- Vermeide Klischees.',
+    translate: 'Du bist ein Übersetzer.\n- Erkenne automatisch ob DE→EN oder EN→DE übersetzt werden soll.\n- Gib nur die Übersetzung aus, ohne Kommentare.\n- Bei Mehrdeutigkeiten nenne kurz die Alternative.',
+    devops:    'Du bist ein erfahrener DevOps-Engineer (Linux, Docker, Shell).\n- Prüfe Befehle auf Sicherheit bevor du sie vorschlägst.\n- Shell-Befehle immer in ```bash Blocks.\n- Bevorzuge deklarative Konfiguration gegenüber imperativen Befehlen.',
+};
+
 // ── Neues Session Formular ─────────────────────────────────────────────────
 $('btn-new').addEventListener('click', () => {
-    $('new-name').value = 'Chat ' + (sessions.length + 1);
-    $('new-sys').value  = '';
+    $('new-name').value   = 'Chat ' + (sessions.length + 1);
+    $('new-sys').value    = '';
+    $('new-preset').value = '';
     $('new-form').style.display = 'flex';
     $('new-name').focus();
     $('new-name').select();
+});
+
+$('new-preset').addEventListener('change', () => {
+    const val = $('new-preset').value;
+    if (val && val !== 'custom') {
+        $('new-sys').value = PRESETS[val] || '';
+    } else if (val === 'custom') {
+        $('new-sys').value = '';
+        $('new-sys').focus();
+    }
 });
 
 $('new-cancel').addEventListener('click', () => {
@@ -157,7 +178,7 @@ function submitNewSession() {
 
 $('new-ok').addEventListener('click', submitNewSession);
 $('new-name').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('new-sys').focus(); } if (e.key === 'Escape') $('new-form').style.display = 'none'; });
-$('new-sys').addEventListener('keydown',  e => { if (e.key === 'Enter') { e.preventDefault(); submitNewSession(); } if (e.key === 'Escape') $('new-form').style.display = 'none'; });
+$('new-sys').addEventListener('keydown',  e => { if (e.key === 'Escape') $('new-form').style.display = 'none'; });
 
 function onSessionCreated(s) {
     sessions.push({ id: s.id, name: s.name, created_at: s.created_at });
@@ -457,3 +478,27 @@ function sysMsg(text) {
     $('msgs').appendChild(d);
     scrollDown();
 }
+
+// ── Agent-Step Anzeige ─────────────────────────────────────────────────────
+let _agentBubble = null; // aktuelle Agent-Step-Bubble (wird aktualisiert, nicht neu erstellt)
+
+function onAgentStep(text) {
+    if (!_agentBubble) {
+        const d = document.createElement('div');
+        d.className = 'msg agent';
+        d.innerHTML = '<div class="bbl"><span class="agent-icon">⚙</span> <span class="agent-text"></span></div>';
+        $('msgs').appendChild(d);
+        _agentBubble = d.querySelector('.agent-text');
+    }
+    _agentBubble.textContent = text;
+    scrollDown();
+}
+
+// Agent-Bubble nach Antwort aufräumen
+const _origChunk = streams;
+window.addEventListener('message', ({ data: m }) => {
+    if ((m.type === 'chat-done' || m.type === 'chat-error') && _agentBubble) {
+        _agentBubble.closest('.msg')?.remove();
+        _agentBubble = null;
+    }
+}, true); // capture-phase vor dem Haupt-Listener
