@@ -7,6 +7,7 @@ let model    = '';
 let sessions = [];
 let active   = null;   // current session object
 let webCfg   = { configured: false, enabled: false, host: '' };
+let toolCfg  = { osCommands: false };
 
 // ── Streams ────────────────────────────────────────────────────────────────
 const streams = {};   // rid → { chunk, done, error }
@@ -31,7 +32,7 @@ sysMsg('Verbinde mit Ollama…');
 vs.postMessage({ type: 'ready' });
 
 // ── Init ───────────────────────────────────────────────────────────────────
-function onInit({ models, sessions: sess, error, web }) {
+function onInit({ models, sessions: sess, error, web, tools }) {
     $('msgs').innerHTML = '';
 
     const sel = $('model');
@@ -45,12 +46,16 @@ function onInit({ models, sessions: sess, error, web }) {
     }
 
     sessions = sess || [];
+    toolCfg = { osCommands: Boolean(tools?.osCommands) };
     webCfg = {
         configured: Boolean(web?.configured),
         enabled: Boolean(web?.defaultEnabled),
         host: web?.host || ''
     };
     syncWebToggle();
+    if (toolCfg.osCommands) {
+        sysMsg('Terminal-Zugriff aktiv: Mit /sh <befehl> fuehrst du lokale Befehle aus.');
+    }
     renderTabs();
 
     if (sessions.length) {
@@ -249,7 +254,13 @@ function renderMd(raw) {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 function $(id)       { return document.getElementById(id); }
-function setSendEnabled(on) { $('send').disabled = !on; $('txt').disabled = !on; $('txt').placeholder = on ? 'Nachricht… (Enter senden, Shift+Enter neue Zeile)' : 'Session auswählen oder ＋ drücken…'; }
+function setSendEnabled(on) {
+    $('send').disabled = !on;
+    $('txt').disabled = !on;
+    $('txt').placeholder = on
+        ? (toolCfg.osCommands ? 'Nachricht… oder /sh <befehl>' : 'Nachricht… (Enter senden, Shift+Enter neue Zeile)')
+        : 'Session auswählen oder ＋ drücken…';
+}
 function esc(t)      { return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function scrollDown(){ const c = $('chat'); c.scrollTop = c.scrollHeight; }
 
@@ -270,6 +281,7 @@ $('btn-status').addEventListener('click', () => {
     if (ov.style.display !== 'none') { ov.style.display = 'none'; return; }
     $('st-ollama').textContent = '⏳ Prüfe…';
     $('st-web').textContent    = '';
+    $('st-os').textContent     = '';
     $('st-db').textContent     = '';
     $('st-rows').textContent   = '';
     $('st-model').textContent  = '';
@@ -278,7 +290,7 @@ $('btn-status').addEventListener('click', () => {
 });
 $('st-close').addEventListener('click', () => { $('status-overlay').style.display = 'none'; });
 
-function onStatusResult({ ollamaOk, ollamaHost, mem, web }) {
+function onStatusResult({ ollamaOk, ollamaHost, mem, web, os }) {
     $('st-ollama').innerHTML = ollamaOk
         ? `<span style="color:#81c784">● Ollama</span> <span style="color:var(--vscode-descriptionForeground)">${ollamaHost}</span>`
         : `<span style="color:#ef5350">✕ Ollama nicht erreichbar</span> <span style="color:var(--vscode-descriptionForeground)">${ollamaHost}</span>`;
@@ -287,6 +299,9 @@ function onStatusResult({ ollamaOk, ollamaHost, mem, web }) {
             ? `<span style="color:#81c784">● Websuche</span> <span style="color:var(--vscode-descriptionForeground)">${esc(web.host)}</span>`
             : `<span style="color:#ef5350">✕ Websuche</span> <span style="color:var(--vscode-descriptionForeground)">${esc(web.error || 'nicht erreichbar')}</span>`)
         : `<span style="color:#ef5350">✕ Websuche</span> <span style="color:var(--vscode-descriptionForeground)">SEARXNG_URL fehlt</span>`;
+    $('st-os').innerHTML = os?.enabled
+        ? `<span style="color:#81c784">● OS-Befehle</span> <span style="color:var(--vscode-descriptionForeground)">/sh aktiv · ${esc(os.shell)} · Timeout ${Math.round((os.timeoutMs || 0) / 1000)}s</span>`
+        : `<span style="color:#ef5350">✕ OS-Befehle</span> <span style="color:var(--vscode-descriptionForeground)">ALLOW_OS_COMMANDS=false</span>`;
     $('st-db').innerHTML = mem.connected
         ? `<span style="color:#81c784">● MariaDB</span> <span style="color:var(--vscode-descriptionForeground)">verbunden</span>`
         : `<span style="color:#ef5350">✕ MariaDB</span> <span style="color:var(--vscode-descriptionForeground)">${mem.error || 'nicht verbunden'}</span>`;

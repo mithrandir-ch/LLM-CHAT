@@ -5,6 +5,7 @@ const https   = require('https');
 const fs      = require('fs');
 const path    = require('path');
 const crypto  = require('crypto');
+const cp      = require('child_process');
 const memory  = require('./memory');
 
 // ── Config ────────────────────────────────────────────────────────────────
@@ -17,6 +18,11 @@ let   searxngSafe    = 1;
 let   searxngMax     = 5;
 let   searxngEngines = '';
 let   webDefaultOn   = false;
+let   osCmdEnabled   = false;
+let   osCmdTimeoutMs = 60000;
+let   osCmdMaxChars  = 12000;
+let   osCmdShell     = process.env.SHELL || '/bin/zsh';
+let   workspaceRoot  = '';
 let   sessionsDir    = '';
 let   log            = console.log;
 
@@ -56,6 +62,10 @@ function readEnv(root) {
     if (env.SEARXNG_MAX_RESULTS) searxngMax = clampInt(env.SEARXNG_MAX_RESULTS, 5, 1, 10);
     if (env.SEARXNG_ENGINES) searxngEngines = env.SEARXNG_ENGINES;
     if (env.WEB_SEARCH_DEFAULT) webDefaultOn = parseBool(env.WEB_SEARCH_DEFAULT, false);
+    if (env.ALLOW_OS_COMMANDS) osCmdEnabled = parseBool(env.ALLOW_OS_COMMANDS, false);
+    if (env.OS_CMD_TIMEOUT_MS) osCmdTimeoutMs = clampInt(env.OS_CMD_TIMEOUT_MS, 60000, 3000, 300000);
+    if (env.OS_CMD_MAX_CHARS) osCmdMaxChars = clampInt(env.OS_CMD_MAX_CHARS, 12000, 1000, 120000);
+    if (env.OS_CMD_SHELL) osCmdShell = env.OS_CMD_SHELL;
 
     if (!searxngUrl && parseBool(env.SEARXNG_AUTO_LOCAL, false)) {
         searxngUrl = SEARXNG_DEFAULT;
@@ -66,6 +76,7 @@ function readEnv(root) {
     } else {
         log('[llm-chat] Keine Websuche konfiguriert (SEARXNG_URL fehlt)');
     }
+    log(`[llm-chat] OS-Commands: ${osCmdEnabled ? 'aktiv' : 'aus'} | shell=${osCmdShell} | timeout=${osCmdTimeoutMs}ms`);
     return env;
 }
 
@@ -104,6 +115,42 @@ function post(url, body, onLine, onEnd, onErr) {
     );
     req.on('error', onErr);
     req.write(bs); req.end();
+}
+
+// ── Local OS Commands ─────────────────────────────────────────────────────
+function extractShellCommand(text) {
+    const m = String(text || '').match(/^\/(?:sh|cmd|exec)\s+([\s\S]+)$/i);
+    return m ? m[1].trim() : '';
+}
+
+function normalizeChunk(chunk) {
+    return String(chunk || '')
+        .replace(/\u0000/g, '')
+        .replace(/\r\n/g, '\n')
+        .replace(/\r/g, '\n');
+}
+
+async function runLocalCommand(command, cwd, onChunk) {
+    return new Promise((resolve, reject) => {
+        let killedByTimeout = false;
+        const child = cp.spawn(osCmdShell, ['-lc', command], { cwd, env: process.env });
+        const timer = setTimeout(() => {
+            killedByTimeout = true;
+            try { child.kill('SIGTERM'); } catch {}
+            setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 1200);
+        }, osCmdTimeoutMs);
+
+        child.stdout.on('data', b => onChunk(normalizeChunk(b.toString('utf8')), 'stdout'));
+        child.stderr.on('data', b => onChunk(normalizeChunk(b.toString('utf8')), 'stderr'));
+        child.on('error', e => {
+            clearTimeout(timer);
+            reject(e);
+        });
+        child.on('close', code => {
+            clearTimeout(timer);
+            resolve({ code: code ?? (killedByTimeout ? 124 : 1), timedOut: killedByTimeout });
+        });
+    });
 }
 
 // ── Web Search (SearXNG) ──────────────────────────────────────────────────
@@ -350,6 +397,7 @@ textarea:focus{outline:none;border-color:var(--vscode-focusBorder)}
   <div style="font-weight:700;margin-bottom:6px;font-size:12px">System-Status</div>
   <div id="st-ollama"></div>
   <div id="st-web"></div>
+  <div id="st-os"></div>
   <div id="st-db"></div>
   <div id="st-rows"></div>
   <div id="st-model" style="color:var(--vscode-descriptionForeground);margin-top:4px"></div>
@@ -409,6 +457,9 @@ class ChatProvider {
                             configured: webSearchConfigured(),
                             defaultEnabled: webDefaultOn && webSearchConfigured(),
                             host: searxngUrl || ''
+                        },
+                        tools: {
+                            osCommands: osCmdEnabled
                         }
                     });
                 } catch (e) {
@@ -422,6 +473,9 @@ class ChatProvider {
                             configured: webSearchConfigured(),
                             defaultEnabled: false,
                             host: searxngUrl || ''
+                        },
+                        tools: {
+                            osCommands: osCmdEnabled
                         }
                     });
                 }
@@ -449,7 +503,8 @@ class ChatProvider {
                 let ollamaOk = false;
                 try { await get(`${ollamaHost}/api/tags`); ollamaOk = true; } catch {}
                 const web = await getWebStatus();
-                view.webview.postMessage({ type: 'status-result', mem, ollamaOk, ollamaHost, web });
+                const os = { enabled: osCmdEnabled, shell: osCmdShell, timeoutMs: osCmdTimeoutMs, maxChars: osCmdMaxChars };
+                view.webview.postMessage({ type: 'status-result', mem, ollamaOk, ollamaHost, web, os });
                 return;
             }
 
@@ -463,6 +518,73 @@ class ChatProvider {
                 let session;
                 try { session = readSession(msg.sessionId); }
                 catch (e) { view.webview.postMessage({ type: 'chat-error', rid: msg.rid, msg: e.message }); return; }
+                const shellCmd = extractShellCommand(msg.text);
+
+                if (shellCmd) {
+                    session.messages.push({ role: 'user', content: msg.text });
+                    writeSession(session);
+
+                    if (!osCmdEnabled) {
+                        const offMsg = 'OS-Befehle sind deaktiviert. Setze ALLOW_OS_COMMANDS=true in .env und lade VS Code neu. Dann nutze /sh <befehl>.';
+                        session.messages.push({ role: 'assistant', content: offMsg });
+                        writeSession(session);
+                        view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: offMsg });
+                        view.webview.postMessage({ type: 'chat-done', rid: msg.rid, tokens: 0, evalMs: 0 });
+                        return;
+                    }
+
+                    const started = Date.now();
+                    let full = `Lokaler Befehl: \`${shellCmd}\`\n\n`;
+                    let sent = full.length;
+                    let clipped = false;
+                    view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: full });
+                    log(`[os] exec: ${shellCmd}`);
+
+                    try {
+                        const result = await runLocalCommand(shellCmd, workspaceRoot || process.cwd(), (chunk, src) => {
+                            if (!chunk || clipped) return;
+                            const room = osCmdMaxChars - sent;
+                            if (room <= 0) { clipped = true; return; }
+                            let text = chunk;
+                            if (text.length > room) {
+                                text = text.slice(0, room);
+                                clipped = true;
+                            }
+                            if (!text) return;
+                            // stderr markieren, damit Fehlerausgaben im Stream sofort sichtbar sind.
+                            if (src === 'stderr' && !full.endsWith('\n[stderr]\n') && !full.includes('\n[stderr]\n')) {
+                                const hdr = '\n[stderr]\n';
+                                full += hdr;
+                                sent += hdr.length;
+                                view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: hdr });
+                            }
+                            full += text;
+                            sent += text.length;
+                            view.webview.postMessage({ type: 'chunk', rid: msg.rid, text });
+                        });
+
+                        if (clipped) {
+                            const cut = `\n\n[Ausgabe gekuerzt bei ${osCmdMaxChars} Zeichen]`;
+                            full += cut;
+                            view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: cut });
+                        }
+                        const tail = `\n\nExit-Code: ${result.code}${result.timedOut ? ' (Timeout)' : ''} · ${Date.now() - started} ms`;
+                        full += tail;
+                        view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: tail });
+                        session.messages.push({ role: 'assistant', content: full });
+                        writeSession(session);
+                        view.webview.postMessage({ type: 'chat-done', rid: msg.rid, tokens: 0, evalMs: 0 });
+                    } catch (e) {
+                        const err = `\n\nFehler bei lokaler Ausfuehrung: ${e.message}`;
+                        full += err;
+                        session.messages.push({ role: 'assistant', content: full });
+                        writeSession(session);
+                        view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: err });
+                        view.webview.postMessage({ type: 'chat-done', rid: msg.rid, tokens: 0, evalMs: 0 });
+                        log(`[os] Fehler: ${e.message}`);
+                    }
+                    return;
+                }
                 let webSources = [];
 
                 // ── Memory: relevante Erinnerungen als Kontext laden ──────
@@ -571,10 +693,11 @@ function activate(ctx) {
     log = m => { out.appendLine(m); console.log(m); };
 
     const root    = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? ctx.extensionUri.fsPath;
+    workspaceRoot = root;
     sessionsDir   = path.join(root, 'sessions');
     const env     = readEnv(root);
 
-    log(`[llm-chat] aktiviert | workspace: ${root} | ollama: ${ollamaHost} | web: ${searxngUrl || 'aus'}`);
+    log(`[llm-chat] aktiviert | workspace: ${root} | ollama: ${ollamaHost} | web: ${searxngUrl || 'aus'} | os-cmd: ${osCmdEnabled ? 'an' : 'aus'}`);
 
     // ── Memory / MariaDB initialisieren ───────────────────────────────────
     if (env.DB_HOST) {
