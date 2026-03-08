@@ -6,6 +6,7 @@ const vs = acquireVsCodeApi();
 let model    = '';
 let sessions = [];
 let active   = null;   // current session object
+let webCfg   = { configured: false, enabled: false, host: '' };
 
 // ── Streams ────────────────────────────────────────────────────────────────
 const streams = {};   // rid → { chunk, done, error }
@@ -20,6 +21,7 @@ window.addEventListener('message', ({ data: m }) => {
         case 'chat-done':  { const s = streams[m.rid]; if (s) { s.done(m.tokens, m.evalMs); delete streams[m.rid]; } break; }
         case 'chat-error': { const s = streams[m.rid]; if (s) { s.error(m.msg); delete streams[m.rid]; } break; }
         case 'status-result': onStatusResult(m); break;
+        case 'web-status': onWebStatus(m); break;
     }
 });
 
@@ -29,7 +31,7 @@ sysMsg('Verbinde mit Ollama…');
 vs.postMessage({ type: 'ready' });
 
 // ── Init ───────────────────────────────────────────────────────────────────
-function onInit({ models, sessions: sess, error }) {
+function onInit({ models, sessions: sess, error, web }) {
     $('msgs').innerHTML = '';
 
     const sel = $('model');
@@ -43,6 +45,12 @@ function onInit({ models, sessions: sess, error }) {
     }
 
     sessions = sess || [];
+    webCfg = {
+        configured: Boolean(web?.configured),
+        enabled: Boolean(web?.defaultEnabled),
+        host: web?.host || ''
+    };
+    syncWebToggle();
     renderTabs();
 
     if (sessions.length) {
@@ -51,6 +59,42 @@ function onInit({ models, sessions: sess, error }) {
         setSendEnabled(false);
         sysMsg('Klicke ＋ um eine neue Session zu starten.');
     }
+}
+
+// ── Web Toggle ────────────────────────────────────────────────────────────
+$('btn-web').addEventListener('click', () => {
+    if (!webCfg.configured) return;
+    webCfg.enabled = !webCfg.enabled;
+    syncWebToggle();
+    sysMsg(webCfg.enabled ? 'Websuche aktiviert.' : 'Websuche deaktiviert.');
+});
+
+function syncWebToggle() {
+    const btn = $('btn-web');
+    btn.textContent = 'WEB';
+    if (!webCfg.configured) {
+        btn.style.opacity = '1';
+        btn.style.filter = '';
+        btn.style.background = 'var(--vscode-inputValidation-errorBackground, rgba(239,83,80,.18))';
+        btn.style.color = 'var(--vscode-inputValidation-errorForeground, #ffb4ab)';
+        btn.style.borderColor = 'var(--vscode-inputValidation-errorBorder, #ef5350)';
+        btn.title = 'Websuche nicht konfiguriert (SEARXNG_URL)';
+        return;
+    }
+    btn.style.filter = '';
+    btn.style.opacity = '1';
+    btn.style.borderColor = webCfg.enabled
+        ? 'var(--vscode-focusBorder, #3794ff)'
+        : 'var(--vscode-panel-border)';
+    btn.style.background = webCfg.enabled
+        ? 'var(--vscode-button-background)'
+        : 'var(--vscode-button-secondaryBackground, #3c3c3c)';
+    btn.style.color = webCfg.enabled
+        ? 'var(--vscode-button-foreground)'
+        : 'var(--vscode-button-secondaryForeground, #ccc)';
+    btn.title = webCfg.enabled
+        ? `Websuche aktiv (${webCfg.host || 'SearXNG'})`
+        : 'Websuche aus';
 }
 
 // ── Sessions ───────────────────────────────────────────────────────────────
@@ -170,7 +214,7 @@ function send() {
         }
     };
 
-    vs.postMessage({ type: 'chat', rid, sessionId: active.id, model, text: txt });
+    vs.postMessage({ type: 'chat', rid, sessionId: active.id, model, text: txt, useWeb: webCfg.enabled });
 }
 
 // ── Markdown ───────────────────────────────────────────────────────────────
@@ -225,6 +269,7 @@ $('btn-status').addEventListener('click', () => {
     const ov = $('status-overlay');
     if (ov.style.display !== 'none') { ov.style.display = 'none'; return; }
     $('st-ollama').textContent = '⏳ Prüfe…';
+    $('st-web').textContent    = '';
     $('st-db').textContent     = '';
     $('st-rows').textContent   = '';
     $('st-model').textContent  = '';
@@ -233,10 +278,15 @@ $('btn-status').addEventListener('click', () => {
 });
 $('st-close').addEventListener('click', () => { $('status-overlay').style.display = 'none'; });
 
-function onStatusResult({ ollamaOk, ollamaHost, mem }) {
+function onStatusResult({ ollamaOk, ollamaHost, mem, web }) {
     $('st-ollama').innerHTML = ollamaOk
         ? `<span style="color:#81c784">● Ollama</span> <span style="color:var(--vscode-descriptionForeground)">${ollamaHost}</span>`
         : `<span style="color:#ef5350">✕ Ollama nicht erreichbar</span> <span style="color:var(--vscode-descriptionForeground)">${ollamaHost}</span>`;
+    $('st-web').innerHTML = web?.configured
+        ? (web.ok
+            ? `<span style="color:#81c784">● Websuche</span> <span style="color:var(--vscode-descriptionForeground)">${esc(web.host)}</span>`
+            : `<span style="color:#ef5350">✕ Websuche</span> <span style="color:var(--vscode-descriptionForeground)">${esc(web.error || 'nicht erreichbar')}</span>`)
+        : `<span style="color:#ef5350">✕ Websuche</span> <span style="color:var(--vscode-descriptionForeground)">SEARXNG_URL fehlt</span>`;
     $('st-db').innerHTML = mem.connected
         ? `<span style="color:#81c784">● MariaDB</span> <span style="color:var(--vscode-descriptionForeground)">verbunden</span>`
         : `<span style="color:#ef5350">✕ MariaDB</span> <span style="color:var(--vscode-descriptionForeground)">${mem.error || 'nicht verbunden'}</span>`;
@@ -244,6 +294,14 @@ function onStatusResult({ ollamaOk, ollamaHost, mem }) {
         ? `<span style="color:var(--vscode-descriptionForeground)">  Erinnerungen gespeichert: <strong>${mem.rows}</strong></span>`
         : '';
     $('st-model').textContent = `Embedding-Modell: ${mem.model}`;
+}
+
+function onWebStatus({ ok, msg, hits, host }) {
+    if (ok) {
+        sysMsg(`🌐 ${msg} (${hits}, ${host})`);
+        return;
+    }
+    sysMsg(`🌐 ${msg}`);
 }
 
 function sysMsg(text) {

@@ -9,9 +9,30 @@ const memory  = require('./memory');
 
 // ── Config ────────────────────────────────────────────────────────────────
 const OLLAMA_DEFAULT = 'http://192.168.1.146:11434';
+const SEARXNG_DEFAULT = 'http://127.0.0.1:8080';
 let   ollamaHost     = OLLAMA_DEFAULT;
+let   searxngUrl     = '';
+let   searxngLang    = 'de';
+let   searxngSafe    = 1;
+let   searxngMax     = 5;
+let   searxngEngines = '';
+let   webDefaultOn   = false;
 let   sessionsDir    = '';
 let   log            = console.log;
+
+function parseBool(v, fallback = false) {
+    if (typeof v !== 'string') return fallback;
+    const n = v.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on', 'ja'].includes(n)) return true;
+    if (['0', 'false', 'no', 'off', 'nein'].includes(n)) return false;
+    return fallback;
+}
+
+function clampInt(v, fallback, min, max) {
+    const n = parseInt(v, 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+}
 
 function readEnv(root) {
     const env = {};
@@ -29,15 +50,31 @@ function readEnv(root) {
         }
     } catch { /* .env optional */ }
     if (env.OLLAMA_HOST)  { ollamaHost = env.OLLAMA_HOST; log(`[llm-chat] OLLAMA_HOST=${ollamaHost}`); }
+    if (env.SEARXNG_URL)  searxngUrl  = env.SEARXNG_URL;
+    if (env.SEARXNG_LANG) searxngLang = env.SEARXNG_LANG;
+    if (env.SEARXNG_SAFESEARCH) searxngSafe = clampInt(env.SEARXNG_SAFESEARCH, 1, 0, 2);
+    if (env.SEARXNG_MAX_RESULTS) searxngMax = clampInt(env.SEARXNG_MAX_RESULTS, 5, 1, 10);
+    if (env.SEARXNG_ENGINES) searxngEngines = env.SEARXNG_ENGINES;
+    if (env.WEB_SEARCH_DEFAULT) webDefaultOn = parseBool(env.WEB_SEARCH_DEFAULT, false);
+
+    if (!searxngUrl && parseBool(env.SEARXNG_AUTO_LOCAL, false)) {
+        searxngUrl = SEARXNG_DEFAULT;
+    }
+    if (searxngUrl) {
+        searxngUrl = searxngUrl.replace(/\/+$/, '');
+        log(`[llm-chat] SEARXNG_URL=${searxngUrl}`);
+    } else {
+        log('[llm-chat] Keine Websuche konfiguriert (SEARXNG_URL fehlt)');
+    }
     return env;
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────
-function get(url) {
+function get(url, headers = {}) {
     return new Promise((ok, fail) => {
         const u   = new URL(url);
         const lib = u.protocol === 'https:' ? https : http;
-        const req = lib.get(url, res => {
+        const req = lib.get(url, { headers }, res => {
             let d = '';
             res.on('data', c => d += c);
             res.on('end', () => { try { ok(JSON.parse(d)); } catch { ok(d); } });
@@ -67,6 +104,125 @@ function post(url, body, onLine, onEnd, onErr) {
     );
     req.on('error', onErr);
     req.write(bs); req.end();
+}
+
+// ── Web Search (SearXNG) ──────────────────────────────────────────────────
+function webSearchConfigured() {
+    return Boolean(searxngUrl);
+}
+
+function oneLine(text, maxLen = 260) {
+    return String(text || '').replace(/\s+/g, ' ').trim().slice(0, maxLen);
+}
+
+function buildSearxSearchUrls(query) {
+    if (!webSearchConfigured()) throw new Error('SEARXNG_URL ist nicht konfiguriert');
+    const base = searxngUrl.endsWith('/') ? searxngUrl : `${searxngUrl}/`;
+    const addParams = u => {
+        u.searchParams.set('q', query);
+        u.searchParams.set('format', 'json');
+        u.searchParams.set('language', searxngLang);
+        u.searchParams.set('safesearch', String(searxngSafe));
+        if (searxngEngines) u.searchParams.set('engines', searxngEngines);
+    };
+
+    const primary = new URL('search', base);
+    addParams(primary);
+
+    const fallback = new URL(base);
+    addParams(fallback);
+
+    const urls = [primary.toString()];
+    if (fallback.toString() !== primary.toString()) urls.push(fallback.toString());
+    return urls;
+}
+
+function parseSearchJson(data) {
+    if (data && typeof data === 'object' && Array.isArray(data.results)) return data;
+    if (typeof data === 'string') {
+        const t = data.trim();
+        if (t.startsWith('{') || t.startsWith('[')) {
+            try {
+                const obj = JSON.parse(t);
+                if (obj && typeof obj === 'object' && Array.isArray(obj.results)) return obj;
+            } catch {}
+        }
+    }
+    return null;
+}
+
+async function runWebSearch(query) {
+    if (!webSearchConfigured()) {
+        return { ok: false, host: '-', hits: 0, results: [], error: 'SEARXNG_URL nicht gesetzt' };
+    }
+
+    const urls = buildSearxSearchUrls(query);
+    const host = new URL(urls[0]).origin;
+    let data = null;
+    let parsed = null;
+
+    for (const url of urls) {
+        data = await get(url, {
+            'Accept': 'application/json',
+            'User-Agent': 'llm-chat/3.0'
+        });
+        parsed = parseSearchJson(data);
+        if (parsed) break;
+    }
+
+    if (!parsed) {
+        const preview = oneLine(typeof data === 'string' ? data : JSON.stringify(data || {}), 160);
+        return {
+            ok: false,
+            host,
+            hits: 0,
+            results: [],
+            error: `Ungueltige SearXNG-Antwort (erwartet JSON mit results[])${preview ? `: ${preview}` : ''}`
+        };
+    }
+
+    const rows = parsed.results;
+
+    const results = rows
+        .filter(r => r && typeof r.url === 'string' && /^https?:\/\//.test(r.url))
+        .slice(0, searxngMax)
+        .map(r => ({
+            title: oneLine(r.title || r.url, 120),
+            url: r.url,
+            content: oneLine(r.content || r.snippet || '', 240)
+        }));
+
+    return { ok: true, host, hits: results.length, results, error: '' };
+}
+
+function buildWebContext(results) {
+    const lines = results.map((r, i) => `${i + 1}. ${r.title}\nURL: ${r.url}\nSnippet: ${r.content || '-'}`);
+    return [
+        `Web-Recherche (SearXNG), Stand: ${new Date().toISOString()}`,
+        'Beantworte die Nutzerfrage konkret anhand dieser Treffer.',
+        'Vermeide generische Aussagen wie "kann auf Websites geprueft werden".',
+        'Wenn konkrete Daten in den Treffern fehlen, sage das explizit in einem Satz.',
+        'Fuehre am Ende immer eine kurze Liste "Quellen:" mit 1-3 verwendeten URLs auf.',
+        ...lines
+    ].join('\n');
+}
+
+function injectSystemContext(messages, content) {
+    let i = 0;
+    while (i < messages.length && messages[i].role === 'system') i++;
+    messages.splice(i, 0, { role: 'system', content });
+}
+
+async function getWebStatus() {
+    if (!webSearchConfigured()) {
+        return { configured: false, ok: false, host: '-', error: 'SEARXNG_URL fehlt' };
+    }
+    try {
+        const ping = await runWebSearch('status');
+        return { configured: true, ok: true, host: ping.host, error: '' };
+    } catch (e) {
+        return { configured: true, ok: false, host: searxngUrl, error: e.message };
+    }
 }
 
 // ── Ollama ────────────────────────────────────────────────────────────────
@@ -187,11 +343,13 @@ textarea:focus{outline:none;border-color:var(--vscode-focusBorder)}
 <div id="bar">
   <select id="model"><option>Lädt…</option></select>
   <span id="stats"></span>
+  <button id="btn-web" title="Websuche ein/aus" style="min-width:40px;height:24px;padding:0 8px;border:1px solid var(--vscode-panel-border);border-radius:4px;background:var(--vscode-button-secondaryBackground,#3c3c3c);color:var(--vscode-button-secondaryForeground,#ccc);cursor:pointer;font-size:10px;font-weight:700;letter-spacing:.3px;flex-shrink:0">WEB</button>
   <button id="btn-status" title="Status anzeigen" style="background:none;border:none;color:var(--vscode-foreground);cursor:pointer;font-size:14px;opacity:.6;padding:0 4px;flex-shrink:0">⚡</button>
 </div>
 <div id="status-overlay" style="display:none;position:absolute;top:36px;right:0;left:0;z-index:99;background:var(--vscode-editorWidget-background,#252526);border:1px solid var(--vscode-panel-border);border-top:none;padding:10px 12px;font-size:11.5px;line-height:1.7">
   <div style="font-weight:700;margin-bottom:6px;font-size:12px">System-Status</div>
   <div id="st-ollama"></div>
+  <div id="st-web"></div>
   <div id="st-db"></div>
   <div id="st-rows"></div>
   <div id="st-model" style="color:var(--vscode-descriptionForeground);margin-top:4px"></div>
@@ -243,10 +401,29 @@ class ChatProvider {
                 try {
                     const [models, sessions] = await Promise.all([getModels(), Promise.resolve(listSessions())]);
                     log(`[llm-chat] models: ${models}`);
-                    view.webview.postMessage({ type: 'init', models, sessions });
+                    view.webview.postMessage({
+                        type: 'init',
+                        models,
+                        sessions,
+                        web: {
+                            configured: webSearchConfigured(),
+                            defaultEnabled: webDefaultOn && webSearchConfigured(),
+                            host: searxngUrl || ''
+                        }
+                    });
                 } catch (e) {
                     log(`[llm-chat] init error: ${e.message}`);
-                    view.webview.postMessage({ type: 'init', models: [], sessions: [], error: e.message });
+                    view.webview.postMessage({
+                        type: 'init',
+                        models: [],
+                        sessions: [],
+                        error: e.message,
+                        web: {
+                            configured: webSearchConfigured(),
+                            defaultEnabled: false,
+                            host: searxngUrl || ''
+                        }
+                    });
                 }
                 return;
             }
@@ -271,7 +448,8 @@ class ChatProvider {
                 const mem = await memory.getStatus();
                 let ollamaOk = false;
                 try { await get(`${ollamaHost}/api/tags`); ollamaOk = true; } catch {}
-                view.webview.postMessage({ type: 'status-result', mem, ollamaOk, ollamaHost });
+                const web = await getWebStatus();
+                view.webview.postMessage({ type: 'status-result', mem, ollamaOk, ollamaHost, web });
                 return;
             }
 
@@ -285,6 +463,7 @@ class ChatProvider {
                 let session;
                 try { session = readSession(msg.sessionId); }
                 catch (e) { view.webview.postMessage({ type: 'chat-error', rid: msg.rid, msg: e.message }); return; }
+                let webSources = [];
 
                 // ── Memory: relevante Erinnerungen als Kontext laden ──────
                 let messagesWithMemory = [...session.messages];
@@ -292,11 +471,57 @@ class ChatProvider {
                     const memCtx = await memory.buildMemoryContext(msg.text, msg.sessionId);
                     if (memCtx) {
                         log(`[memory] Kontext gefunden → injiziere`);
-                        // System-Message mit Erinnerungen vorne einsetzen (nach bestehendem System-Prompt)
-                        const sysIdx = messagesWithMemory.findIndex(m => m.role === 'system');
-                        const memMsg = { role: 'system', content: memCtx };
-                        if (sysIdx >= 0) messagesWithMemory.splice(sysIdx + 1, 0, memMsg);
-                        else             messagesWithMemory.unshift(memMsg);
+                        injectSystemContext(messagesWithMemory, memCtx);
+                    }
+                }
+
+                // ── Websuche (SearXNG) optional als zusätzlicher Kontext ──
+                if (msg.useWeb) {
+                    try {
+                        const search = await runWebSearch(msg.text);
+                        if (!search.ok) {
+                            view.webview.postMessage({
+                                type: 'web-status',
+                                rid: msg.rid,
+                                ok: false,
+                                msg: `Websuche nicht verfuegbar: ${search.error}`,
+                                hits: 0,
+                                host: search.host
+                            });
+                            log(`[web] nicht verfuegbar: ${search.error}`);
+                        } else if (search.hits > 0) {
+                            webSources = search.results;
+                            injectSystemContext(messagesWithMemory, buildWebContext(search.results));
+                            view.webview.postMessage({
+                                type: 'web-status',
+                                rid: msg.rid,
+                                ok: true,
+                                msg: `Websuche aktiv: ${search.hits} Treffer`,
+                                hits: search.hits,
+                                host: search.host
+                            });
+                            log(`[web] Treffer: ${search.hits} (${search.host})`);
+                        } else {
+                            view.webview.postMessage({
+                                type: 'web-status',
+                                rid: msg.rid,
+                                ok: false,
+                                msg: 'Websuche aktiv, aber keine Treffer gefunden',
+                                hits: 0,
+                                host: search.host
+                            });
+                            log('[web] keine Treffer');
+                        }
+                    } catch (e) {
+                        view.webview.postMessage({
+                            type: 'web-status',
+                            rid: msg.rid,
+                            ok: false,
+                            msg: `Websuche fehlgeschlagen: ${e.message}`,
+                            hits: 0,
+                            host: searxngUrl || '-'
+                        });
+                        log(`[web] Fehler: ${e.message}`);
                     }
                 }
 
@@ -312,6 +537,15 @@ class ChatProvider {
                         const t = obj.message?.content || '';
                         if (t) { full += t; view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: t }); }
                         if (obj.done) {
+                            if (webSources.length > 0 && !/quellen\s*:/i.test(full)) {
+                                const src = webSources
+                                    .slice(0, 3)
+                                    .map((r, i) => `${i + 1}. ${r.title} - ${r.url}`)
+                                    .join('\n');
+                                const appendix = `\n\nQuellen:\n${src}`;
+                                full += appendix;
+                                view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: appendix });
+                            }
                             session.messages.push({ role: 'assistant', content: full });
                             writeSession(session);
                             view.webview.postMessage({ type: 'chat-done', rid: msg.rid, tokens: obj.eval_count || 0, evalMs: obj.eval_duration || 0 });
@@ -340,7 +574,7 @@ function activate(ctx) {
     sessionsDir   = path.join(root, 'sessions');
     const env     = readEnv(root);
 
-    log(`[llm-chat] aktiviert | workspace: ${root} | ollama: ${ollamaHost}`);
+    log(`[llm-chat] aktiviert | workspace: ${root} | ollama: ${ollamaHost} | web: ${searxngUrl || 'aus'}`);
 
     // ── Memory / MariaDB initialisieren ───────────────────────────────────
     if (env.DB_HOST) {
