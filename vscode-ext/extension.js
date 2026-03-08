@@ -22,6 +22,12 @@ let   osCmdEnabled   = false;
 let   osCmdTimeoutMs = 60000;
 let   osCmdMaxChars  = 12000;
 let   osCmdShell     = process.env.SHELL || '/bin/zsh';
+let   fsToolEnabled  = true;
+let   fsWriteEnabled = true;
+let   fsToolAllowOutside = false;
+let   fsToolMaxChars = 0; // 0 = unbegrenzt
+let   fsToolMaxEntries = 0; // 0 = unbegrenzt
+let   maxContextMessages = 40; // 0 = unbegrenzt
 let   workspaceRoot  = '';
 let   sessionsDir    = '';
 let   log            = console.log;
@@ -38,6 +44,12 @@ function clampInt(v, fallback, min, max) {
     const n = parseInt(v, 10);
     if (!Number.isFinite(n)) return fallback;
     return Math.min(max, Math.max(min, n));
+}
+
+function parseNonNegativeInt(v, fallback) {
+    const n = parseInt(v, 10);
+    if (!Number.isFinite(n) || n < 0) return fallback;
+    return n;
 }
 
 function readEnv(root) {
@@ -66,6 +78,12 @@ function readEnv(root) {
     if (env.OS_CMD_TIMEOUT_MS) osCmdTimeoutMs = clampInt(env.OS_CMD_TIMEOUT_MS, 60000, 3000, 300000);
     if (env.OS_CMD_MAX_CHARS) osCmdMaxChars = clampInt(env.OS_CMD_MAX_CHARS, 12000, 1000, 120000);
     if (env.OS_CMD_SHELL) osCmdShell = env.OS_CMD_SHELL;
+    if (env.ALLOW_FS_TOOL) fsToolEnabled = parseBool(env.ALLOW_FS_TOOL, true);
+    if (env.ALLOW_FS_WRITE) fsWriteEnabled = parseBool(env.ALLOW_FS_WRITE, true);
+    if (env.FS_TOOL_ALLOW_OUTSIDE_WORKSPACE) fsToolAllowOutside = parseBool(env.FS_TOOL_ALLOW_OUTSIDE_WORKSPACE, false);
+    if (env.FS_TOOL_MAX_CHARS) fsToolMaxChars = parseNonNegativeInt(env.FS_TOOL_MAX_CHARS, 0);
+    if (env.FS_TOOL_MAX_ENTRIES) fsToolMaxEntries = parseNonNegativeInt(env.FS_TOOL_MAX_ENTRIES, 0);
+    if (env.MAX_CONTEXT_MESSAGES) maxContextMessages = parseNonNegativeInt(env.MAX_CONTEXT_MESSAGES, 40);
 
     if (!searxngUrl && parseBool(env.SEARXNG_AUTO_LOCAL, false)) {
         searxngUrl = SEARXNG_DEFAULT;
@@ -77,6 +95,7 @@ function readEnv(root) {
         log('[llm-chat] Keine Websuche konfiguriert (SEARXNG_URL fehlt)');
     }
     log(`[llm-chat] OS-Commands: ${osCmdEnabled ? 'aktiv' : 'aus'} | shell=${osCmdShell} | timeout=${osCmdTimeoutMs}ms`);
+    log(`[llm-chat] FS-Tool: ${fsToolEnabled ? 'aktiv' : 'aus'} | write=${fsWriteEnabled ? 'an' : 'aus'} | outside=${fsToolAllowOutside ? 'ja' : 'nein'} | maxChars=${fsToolMaxChars || 'unbegrenzt'} | maxEntries=${fsToolMaxEntries || 'unbegrenzt'}`);
     return env;
 }
 
@@ -151,6 +170,336 @@ async function runLocalCommand(command, cwd, onChunk) {
             resolve({ code: code ?? (killedByTimeout ? 124 : 1), timedOut: killedByTimeout });
         });
     });
+}
+
+// ── FileSystem Tool (read-only) ───────────────────────────────────────────
+function extractFsCommand(text) {
+    const m = String(text || '').match(/^\/fs(?:\s+([\s\S]+))?$/i);
+    if (!m) return '';
+    return (m[1] || 'help').trim() || 'help';
+}
+
+function parseArgs(input) {
+    const out = [];
+    const rx = /"([^"]*)"|'([^']*)'|`([^`]*)`|(\S+)/g;
+    let m;
+    while ((m = rx.exec(String(input || '')))) out.push(m[1] ?? m[2] ?? m[3] ?? m[4]);
+    return out;
+}
+
+function isInside(base, target) {
+    const rel = path.relative(base, target);
+    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function displayPath(absPath) {
+    if (workspaceRoot && isInside(workspaceRoot, absPath)) {
+        const rel = path.relative(workspaceRoot, absPath);
+        return rel || '.';
+    }
+    return absPath;
+}
+
+function resolveFsPath(inputPath = '.', { mustExist = true } = {}) {
+    const base = workspaceRoot || process.cwd();
+    const raw = String(inputPath || '.').trim();
+    const abs = path.resolve(path.isAbsolute(raw) ? raw : path.join(base, raw));
+    if (!fsToolAllowOutside && workspaceRoot && !isInside(workspaceRoot, abs)) {
+        throw new Error(`Pfad ausserhalb Workspace nicht erlaubt: ${abs}`);
+    }
+    if (mustExist && !fs.existsSync(abs)) throw new Error(`Pfad nicht gefunden: ${abs}`);
+    return abs;
+}
+
+function clipFsOutput(text) {
+    if (!fsToolMaxChars || fsToolMaxChars <= 0) return text;
+    if (text.length <= fsToolMaxChars) return text;
+    return `${text.slice(0, fsToolMaxChars)}\n\n[Ausgabe gekuerzt bei ${fsToolMaxChars} Zeichen]`;
+}
+
+function fsEntryLimit() {
+    return fsToolMaxEntries > 0 ? fsToolMaxEntries : Number.MAX_SAFE_INTEGER;
+}
+
+function formatSize(bytes) {
+    if (!Number.isFinite(bytes)) return '-';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function listDir(absPath) {
+    const st = fs.statSync(absPath);
+    if (!st.isDirectory()) {
+        return `${displayPath(absPath)}\nF  ${path.basename(absPath)}  (${formatSize(st.size)})`;
+    }
+    const rows = fs.readdirSync(absPath, { withFileTypes: true });
+    rows.sort((a, b) => {
+        if (a.isDirectory() && !b.isDirectory()) return -1;
+        if (!a.isDirectory() && b.isDirectory()) return 1;
+        return a.name.localeCompare(b.name);
+    });
+    const max = fsEntryLimit();
+    const shown = rows.slice(0, max);
+    const lines = [`${displayPath(absPath)} (${rows.length} Eintraege)`];
+    for (const e of shown) {
+        const p = path.join(absPath, e.name);
+        if (e.isDirectory()) {
+            lines.push(`D  ${e.name}/`);
+        } else if (e.isSymbolicLink()) {
+            lines.push(`L  ${e.name}@`);
+        } else {
+            const sz = fs.statSync(p).size;
+            lines.push(`F  ${e.name}  (${formatSize(sz)})`);
+        }
+    }
+    if (rows.length > shown.length) lines.push(`... +${rows.length - shown.length} weitere`);
+    return lines.join('\n');
+}
+
+function treeDir(absPath, maxDepth) {
+    const lines = [displayPath(absPath)];
+    let count = 0;
+    const max = fsEntryLimit();
+
+    const walk = (dir, prefix, depth) => {
+        if (depth >= maxDepth || count >= max) return;
+        let rows = fs.readdirSync(dir, { withFileTypes: true });
+        rows.sort((a, b) => {
+            if (a.isDirectory() && !b.isDirectory()) return -1;
+            if (!a.isDirectory() && b.isDirectory()) return 1;
+            return a.name.localeCompare(b.name);
+        });
+
+        for (let i = 0; i < rows.length; i++) {
+            if (count >= max) break;
+            const e = rows[i];
+            const isLast = i === rows.length - 1;
+            const branch = isLast ? '`-- ' : '|-- ';
+            const nextPrefix = prefix + (isLast ? '    ' : '|   ');
+            const label = e.isDirectory() ? `${e.name}/` : (e.isSymbolicLink() ? `${e.name}@` : e.name);
+            lines.push(`${prefix}${branch}${label}`);
+            count++;
+            if (e.isDirectory()) walk(path.join(dir, e.name), nextPrefix, depth + 1);
+        }
+    };
+
+    if (!fs.statSync(absPath).isDirectory()) return listDir(absPath);
+    walk(absPath, '', 0);
+    if (count >= max && Number.isFinite(max)) lines.push(`... Ausgabe begrenzt auf ${fsToolMaxEntries} Eintraege`);
+    return lines.join('\n');
+}
+
+function readFileLines(absPath, fromLine, toLine) {
+    const st = fs.statSync(absPath);
+    if (st.isDirectory()) throw new Error('read erwartet eine Datei, kein Verzeichnis');
+    const buf = fs.readFileSync(absPath);
+    if (buf.includes(0)) throw new Error('Datei scheint binaer zu sein');
+    const lines = buf.toString('utf8').split(/\r?\n/);
+    const from = Math.max(1, fromLine);
+    const to = Math.min(lines.length, Math.max(from, toLine));
+    const out = [`${displayPath(absPath)} (Zeilen ${from}-${to} / ${lines.length})`];
+    for (let i = from - 1; i < to; i++) {
+        out.push(`${String(i + 1).padStart(5, ' ')} | ${lines[i]}`);
+    }
+    return out.join('\n');
+}
+
+function findNames(needle, absPath) {
+    const q = String(needle || '').toLowerCase();
+    if (!q) throw new Error('find erwartet ein Suchmuster');
+    const start = fs.statSync(absPath).isDirectory() ? absPath : path.dirname(absPath);
+    const stack = [start];
+    const out = [];
+    let scanned = 0;
+
+    const max = fsEntryLimit();
+    const maxScanned = Number.isFinite(max) ? max * 30 : Number.MAX_SAFE_INTEGER;
+    while (stack.length && out.length < max && scanned < maxScanned) {
+        const dir = stack.pop();
+        let rows = [];
+        try { rows = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+        for (const e of rows) {
+            scanned++;
+            const p = path.join(dir, e.name);
+            if (e.name.toLowerCase().includes(q)) out.push(displayPath(p));
+            if (e.isDirectory()) stack.push(p);
+            if (out.length >= max) break;
+        }
+    }
+
+    if (!out.length) return `Keine Dateinamen mit "${needle}" gefunden.`;
+    return [`Treffer (${out.length}):`, ...out].join('\n');
+}
+
+function grepContent(pattern, absPath) {
+    if (!String(pattern || '').trim()) throw new Error('grep erwartet ein Suchmuster');
+    const args = ['-n', '-S'];
+    if (fsToolMaxEntries > 0) args.push('--max-count', String(fsToolMaxEntries));
+    args.push(pattern, absPath);
+    const res = cp.spawnSync('rg', args, { encoding: 'utf8' });
+    if (res.error) throw new Error(`rg nicht verfuegbar: ${res.error.message}`);
+    if (res.status === 0) return res.stdout.trim() || 'Treffer gefunden, aber keine Ausgabe.';
+    if (res.status === 1) return `Keine Treffer fuer "${pattern}".`;
+    throw new Error((res.stderr || '').trim() || `rg exit ${res.status}`);
+}
+
+function isFsMutatingCommand(rawCmd) {
+    const parts = parseArgs(rawCmd);
+    const cmd = (parts.shift() || 'help').toLowerCase();
+    return ['write', 'append', 'rm', 'mkdir', 'mv', 'cp', 'touch'].includes(cmd);
+}
+
+function writeFileContent(absPath, text, append = false) {
+    const dir = path.dirname(absPath);
+    fs.mkdirSync(dir, { recursive: true });
+    if (append) fs.appendFileSync(absPath, text, 'utf8');
+    else fs.writeFileSync(absPath, text, 'utf8');
+    const st = fs.statSync(absPath);
+    return `${displayPath(absPath)} geschrieben (${formatSize(st.size)})`;
+}
+
+function runFsTool(rawCmd) {
+    const parts = parseArgs(rawCmd);
+    const cmd = (parts.shift() || 'help').toLowerCase();
+
+    if (cmd === 'help') {
+        return [
+            'Dateisystem-Tool',
+            '',
+            'Befehle:',
+            '  /fs help',
+            '  /fs info',
+            '  /fs ls [pfad]',
+            '  /fs tree [pfad] [tiefe]',
+            '  /fs read <datei> [von] [bis]',
+            '  /fs find <name-teil> [pfad]',
+            '  /fs grep <muster> [pfad]',
+            '  /fs write <datei> <text>',
+            '  /fs append <datei> <text>',
+            '  /fs touch <datei>',
+            '  /fs mkdir <ordner>',
+            '  /fs mv <quelle> <ziel>',
+            '  /fs cp <quelle> <ziel>',
+            '  /fs rm <pfad>',
+            '',
+            'Beispiele:',
+            '  /fs ls .',
+            '  /fs tree . 2',
+            '  /fs read vscode-ext/extension.js 1 120',
+            '  /fs find package .',
+            '  /fs grep "runLocalCommand" vscode-ext',
+            '  /fs write notes/todo.txt "Erster Eintrag"',
+            '  /fs append notes/todo.txt "Zweiter Eintrag"',
+            '  /fs rm notes/alt.txt'
+        ].join('\n');
+    }
+
+    if (cmd === 'info') {
+        return [
+            'Dateisystem-Tool Status',
+            `  aktiv: ${fsToolEnabled ? 'ja' : 'nein'}`,
+            `  schreiben: ${fsWriteEnabled ? 'ja' : 'nein'}`,
+            `  workspace: ${workspaceRoot || '-'}`,
+            `  ausserhalb erlaubt: ${fsToolAllowOutside ? 'ja' : 'nein'}`,
+            `  max chars: ${fsToolMaxChars || 'unbegrenzt'}`,
+            `  max entries: ${fsToolMaxEntries || 'unbegrenzt'}`
+        ].join('\n');
+    }
+
+    if (cmd === 'ls') {
+        const abs = resolveFsPath(parts[0] || '.');
+        return clipFsOutput(listDir(abs));
+    }
+
+    if (cmd === 'tree') {
+        const pathArg = parts[0] && !/^\d+$/.test(parts[0]) ? parts[0] : '.';
+        const depthArg = /^\d+$/.test(parts[0]) ? parts[0] : (parts[1] || '2');
+        const depth = clampInt(depthArg, 2, 1, 8);
+        const abs = resolveFsPath(pathArg);
+        return clipFsOutput(treeDir(abs, depth));
+    }
+
+    if (cmd === 'read' || cmd === 'cat') {
+        if (!parts[0]) throw new Error('read erwartet einen Dateipfad');
+        const abs = resolveFsPath(parts[0]);
+        const from = clampInt(parts[1] || '1', 1, 1, 2000000);
+        const to = clampInt(parts[2] || String(from + 199), from + 199, from, from + 800);
+        return clipFsOutput(readFileLines(abs, from, to));
+    }
+
+    if (cmd === 'find') {
+        const needle = parts[0];
+        const abs = resolveFsPath(parts[1] || '.');
+        return clipFsOutput(findNames(needle, abs));
+    }
+
+    if (cmd === 'grep') {
+        const pattern = parts[0];
+        const abs = resolveFsPath(parts[1] || '.');
+        return clipFsOutput(grepContent(pattern, abs));
+    }
+
+    if (['write', 'append', 'touch', 'mkdir', 'mv', 'cp', 'rm'].includes(cmd) && !fsWriteEnabled) {
+        throw new Error('Schreiboperationen sind deaktiviert (ALLOW_FS_WRITE=false)');
+    }
+
+    if (cmd === 'write') {
+        if (!parts[0]) throw new Error('write erwartet einen Dateipfad');
+        if (parts.length < 2) throw new Error('write erwartet Textinhalt');
+        const abs = resolveFsPath(parts[0], { mustExist: false });
+        return writeFileContent(abs, parts.slice(1).join(' '), false);
+    }
+
+    if (cmd === 'append') {
+        if (!parts[0]) throw new Error('append erwartet einen Dateipfad');
+        if (parts.length < 2) throw new Error('append erwartet Textinhalt');
+        const abs = resolveFsPath(parts[0], { mustExist: false });
+        return writeFileContent(abs, parts.slice(1).join(' '), true);
+    }
+
+    if (cmd === 'touch') {
+        if (!parts[0]) throw new Error('touch erwartet einen Dateipfad');
+        const abs = resolveFsPath(parts[0], { mustExist: false });
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        if (!fs.existsSync(abs)) fs.writeFileSync(abs, '', 'utf8');
+        else fs.utimesSync(abs, new Date(), new Date());
+        return `Datei aktualisiert: ${displayPath(abs)}`;
+    }
+
+    if (cmd === 'mkdir') {
+        if (!parts[0]) throw new Error('mkdir erwartet einen Ordnerpfad');
+        const abs = resolveFsPath(parts[0], { mustExist: false });
+        fs.mkdirSync(abs, { recursive: true });
+        return `Ordner erstellt: ${displayPath(abs)}`;
+    }
+
+    if (cmd === 'mv') {
+        if (!parts[0] || !parts[1]) throw new Error('mv erwartet <quelle> <ziel>');
+        const src = resolveFsPath(parts[0], { mustExist: true });
+        const dst = resolveFsPath(parts[1], { mustExist: false });
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        fs.renameSync(src, dst);
+        return `Verschoben: ${displayPath(src)} -> ${displayPath(dst)}`;
+    }
+
+    if (cmd === 'cp') {
+        if (!parts[0] || !parts[1]) throw new Error('cp erwartet <quelle> <ziel>');
+        const src = resolveFsPath(parts[0], { mustExist: true });
+        const dst = resolveFsPath(parts[1], { mustExist: false });
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        fs.cpSync(src, dst, { recursive: true, force: true });
+        return `Kopiert: ${displayPath(src)} -> ${displayPath(dst)}`;
+    }
+
+    if (cmd === 'rm') {
+        if (!parts[0]) throw new Error('rm erwartet einen Pfad');
+        const abs = resolveFsPath(parts[0], { mustExist: true });
+        fs.rmSync(abs, { recursive: true, force: false });
+        return `Geloescht: ${displayPath(abs)}`;
+    }
+
+    throw new Error(`Unbekannter /fs Befehl: ${cmd}. Nutze /fs help`);
 }
 
 // ── Web Search (SearXNG) ──────────────────────────────────────────────────
@@ -258,6 +607,54 @@ function injectSystemContext(messages, content) {
     let i = 0;
     while (i < messages.length && messages[i].role === 'system') i++;
     messages.splice(i, 0, { role: 'system', content });
+}
+
+// ── Auto-Pfad-Erkennung ────────────────────────────────────────────────────
+function extractPathsFromText(text) {
+    const found = [];
+    // Absoluter Pfad: /word/... mit mindestens 2 Segmenten, keine Whitespace/Sonderzeichen
+    const rx = /(?:^|[\s(["'`])(\/[^\s"'`()[\]{}\\,;]+)/g;
+    let m;
+    while ((m = rx.exec(String(text || '')))) {
+        let p = m[1].replace(/[.,;:!?'"`)]+$/, '').replace(/\/+$/, '');
+        if ((p.match(/\//g) || []).length < 2) continue; // min. 2 Slashes = 2 Segmente
+        if (/^\/(sh|fs|cmd|exec|web|fs-confirm|sh-confirm)(\s|$)/i.test(p)) continue;
+        found.push(p);
+    }
+    return [...new Set(found)];
+}
+
+async function autoInjectFileContext(text, messages) {
+    if (!fsToolEnabled) return 0;
+    const paths = extractPathsFromText(text);
+    if (!paths.length) return 0;
+
+    const parts = [];
+    for (const p of paths) {
+        try {
+            const abs = resolveFsPath(p, { mustExist: true });
+            const st  = fs.statSync(abs);
+            const content = st.isDirectory()
+                ? clipFsOutput(treeDir(abs, 2))
+                : clipFsOutput(readFileLines(abs, 1, 400));
+            parts.push(`--- ${displayPath(abs)} ---\n${content}`);
+            log(`[auto-fs] injiziert: ${abs}`);
+        } catch { /* Pfad nicht lesbar oder ausserhalb Workspace → ignorieren */ }
+    }
+
+    if (!parts.length) return 0;
+    injectSystemContext(messages,
+        `Automatisch geladener Datei-/Ordnerinhalt (als Kontext nutzen, nicht wörtlich zitieren):\n\n${parts.join('\n\n')}`
+    );
+    return parts.length;
+}
+
+// Punkt 1: Context-Limit — System-Messages bleiben immer erhalten
+function trimContext(messages) {
+    if (!maxContextMessages || maxContextMessages <= 0) return messages;
+    const system = messages.filter(m => m.role === 'system');
+    const rest   = messages.filter(m => m.role !== 'system');
+    return [...system, ...rest.slice(-maxContextMessages)];
 }
 
 async function getWebStatus() {
@@ -398,6 +795,7 @@ textarea:focus{outline:none;border-color:var(--vscode-focusBorder)}
   <div id="st-ollama"></div>
   <div id="st-web"></div>
   <div id="st-os"></div>
+  <div id="st-fs"></div>
   <div id="st-db"></div>
   <div id="st-rows"></div>
   <div id="st-model" style="color:var(--vscode-descriptionForeground);margin-top:4px"></div>
@@ -459,7 +857,9 @@ class ChatProvider {
                             host: searxngUrl || ''
                         },
                         tools: {
-                            osCommands: osCmdEnabled
+                            osCommands: osCmdEnabled,
+                            fsTool: fsToolEnabled,
+                            fsWrite: fsWriteEnabled
                         }
                     });
                 } catch (e) {
@@ -475,7 +875,9 @@ class ChatProvider {
                             host: searxngUrl || ''
                         },
                         tools: {
-                            osCommands: osCmdEnabled
+                            osCommands: osCmdEnabled,
+                            fsTool: fsToolEnabled,
+                            fsWrite: fsWriteEnabled
                         }
                     });
                 }
@@ -504,7 +906,15 @@ class ChatProvider {
                 try { await get(`${ollamaHost}/api/tags`); ollamaOk = true; } catch {}
                 const web = await getWebStatus();
                 const os = { enabled: osCmdEnabled, shell: osCmdShell, timeoutMs: osCmdTimeoutMs, maxChars: osCmdMaxChars };
-                view.webview.postMessage({ type: 'status-result', mem, ollamaOk, ollamaHost, web, os });
+                const fsInfo = {
+                    enabled: fsToolEnabled,
+                    writeEnabled: fsWriteEnabled,
+                    allowOutside: fsToolAllowOutside,
+                    root: workspaceRoot || '-',
+                    maxChars: fsToolMaxChars,
+                    maxEntries: fsToolMaxEntries
+                };
+                view.webview.postMessage({ type: 'status-result', mem, ollamaOk, ollamaHost, web, os, fs: fsInfo });
                 return;
             }
 
@@ -518,11 +928,57 @@ class ChatProvider {
                 let session;
                 try { session = readSession(msg.sessionId); }
                 catch (e) { view.webview.postMessage({ type: 'chat-error', rid: msg.rid, msg: e.message }); return; }
+                const fsCmd = extractFsCommand(msg.text);
                 const shellCmd = extractShellCommand(msg.text);
+
+                if (fsCmd) {
+                    session.messages.push({ role: 'user', content: msg.text });
+                    writeSession(session);
+
+                    if (isFsMutatingCommand(fsCmd) && !msg.fsWriteApproved) {
+                        const askMsg = 'Dateisystem-Schreibbefehl wurde nicht bestaetigt. Bitte mit JA / NEIN bestaetigen.';
+                        session.messages.push({ role: 'assistant', content: askMsg });
+                        writeSession(session);
+                        view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: askMsg });
+                        view.webview.postMessage({ type: 'chat-done', rid: msg.rid, tokens: 0, evalMs: 0 });
+                        return;
+                    }
+
+                    let answer = '';
+                    if (!fsToolEnabled) {
+                        answer = 'Dateisystem-Tool ist deaktiviert. Setze ALLOW_FS_TOOL=true in .env und lade VS Code neu.';
+                    } else {
+                        // Punkt 4: setImmediate verhindert Blockieren des Extension-Host-Event-Loops
+                        try {
+                            const out = await new Promise((res, rej) =>
+                                setImmediate(() => { try { res(runFsTool(fsCmd)); } catch (e) { rej(e); } })
+                            );
+                            answer = `Dateisystem-Tool Ergebnis:\n\n\`\`\`text\n${out}\n\`\`\``;
+                            log(`[fs] /fs ${fsCmd.split(' ')[0] || 'help'}`);
+                        } catch (e) {
+                            answer = `Dateisystem-Tool Fehler: ${e.message}`;
+                            log(`[fs] Fehler: ${e.message}`);
+                        }
+                    }
+                    session.messages.push({ role: 'assistant', content: answer });
+                    writeSession(session);
+                    view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: answer });
+                    view.webview.postMessage({ type: 'chat-done', rid: msg.rid, tokens: 0, evalMs: 0 });
+                    return;
+                }
 
                 if (shellCmd) {
                     session.messages.push({ role: 'user', content: msg.text });
                     writeSession(session);
+
+                    if (!msg.osApproved) {
+                        const askMsg = 'OS-Befehl wurde nicht bestaetigt. Bitte mit JA / NEIN bestaetigen.';
+                        session.messages.push({ role: 'assistant', content: askMsg });
+                        writeSession(session);
+                        view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: askMsg });
+                        view.webview.postMessage({ type: 'chat-done', rid: msg.rid, tokens: 0, evalMs: 0 });
+                        return;
+                    }
 
                     if (!osCmdEnabled) {
                         const offMsg = 'OS-Befehle sind deaktiviert. Setze ALLOW_OS_COMMANDS=true in .env und lade VS Code neu. Dann nutze /sh <befehl>.';
@@ -537,6 +993,8 @@ class ChatProvider {
                     let full = `Lokaler Befehl: \`${shellCmd}\`\n\n`;
                     let sent = full.length;
                     let clipped = false;
+                    // Punkt 5: einfaches Flag statt komplexer String-Suche
+                    let stderrHeaderSent = false;
                     view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: full });
                     log(`[os] exec: ${shellCmd}`);
 
@@ -551,8 +1009,9 @@ class ChatProvider {
                                 clipped = true;
                             }
                             if (!text) return;
-                            // stderr markieren, damit Fehlerausgaben im Stream sofort sichtbar sind.
-                            if (src === 'stderr' && !full.endsWith('\n[stderr]\n') && !full.includes('\n[stderr]\n')) {
+                            // stderr einmalig markieren, damit Fehlerausgaben im Stream sofort sichtbar sind.
+                            if (src === 'stderr' && !stderrHeaderSent) {
+                                stderrHeaderSent = true;
                                 const hdr = '\n[stderr]\n';
                                 full += hdr;
                                 sent += hdr.length;
@@ -595,6 +1054,12 @@ class ChatProvider {
                         log(`[memory] Kontext gefunden → injiziere`);
                         injectSystemContext(messagesWithMemory, memCtx);
                     }
+                }
+
+                // ── Auto-Pfad-Erkennung: Dateien/Ordner aus Nachricht laden ──
+                const autoFsCount = await autoInjectFileContext(msg.text, messagesWithMemory);
+                if (autoFsCount > 0) {
+                    view.webview.postMessage({ type: 'fs-inject', count: autoFsCount });
                 }
 
                 // ── Websuche (SearXNG) optional als zusätzlicher Kontext ──
@@ -654,7 +1119,7 @@ class ChatProvider {
                 let full = '';
                 post(
                     `${ollamaHost}/api/chat`,
-                    { model: msg.model, messages: messagesWithMemory, stream: true },
+                    { model: msg.model, messages: trimContext(messagesWithMemory), stream: true },
                     obj => {
                         const t = obj.message?.content || '';
                         if (t) { full += t; view.webview.postMessage({ type: 'chunk', rid: msg.rid, text: t }); }
@@ -697,18 +1162,21 @@ function activate(ctx) {
     sessionsDir   = path.join(root, 'sessions');
     const env     = readEnv(root);
 
-    log(`[llm-chat] aktiviert | workspace: ${root} | ollama: ${ollamaHost} | web: ${searxngUrl || 'aus'} | os-cmd: ${osCmdEnabled ? 'an' : 'aus'}`);
+    log(`[llm-chat] aktiviert | workspace: ${root} | ollama: ${ollamaHost} | web: ${searxngUrl || 'aus'} | os-cmd: ${osCmdEnabled ? 'an' : 'aus'} | fs-tool: ${fsToolEnabled ? 'an' : 'aus'}`);
 
     // ── Memory / MariaDB initialisieren ───────────────────────────────────
     if (env.DB_HOST) {
         memory.init({
             ollamaHost,
-            embedModel: env.EMBEDDING_MODEL || 'nomic-embed-text',
-            dbHost:     env.DB_HOST,
-            dbPort:     parseInt(env.DB_PORT || '3306'),
-            dbUser:     env.DB_USER,
-            dbPass:     env.DB_PASSWORD,
-            dbName:     env.DB_NAME,
+            embedModel:   env.EMBEDDING_MODEL    || 'nomic-embed-text',
+            dbHost:       env.DB_HOST,
+            dbPort:       parseInt(env.DB_PORT   || '3306'),
+            dbUser:       env.DB_USER,
+            dbPass:       env.DB_PASSWORD,
+            dbName:       env.DB_NAME,
+            topK:         parseNonNegativeInt(env.MEMORY_TOP_K,        5),
+            minScore:     parseFloat(env.MEMORY_MIN_SCORE            || '0.65'),
+            searchLimit:  parseNonNegativeInt(env.MEMORY_SEARCH_LIMIT, 200),
         }, m => { out.appendLine(m); console.log(m); }).then(ok => {
             log(ok ? '[memory] Langzeitgedächtnis aktiv' : '[memory] Deaktiviert (kein DB-Zugang)');
         });

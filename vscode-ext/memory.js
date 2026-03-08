@@ -22,14 +22,19 @@ let lastCfg     = null;
 let lastError   = null;
 let initPromise = null;
 
-const TOP_K     = 5;    // Anzahl ähnlichster Erinnerungen die als Kontext genutzt werden
-const MIN_SCORE = 0.65; // Mindestschwelle für Cosine Similarity
+// Punkt 2: via init(cfg) konfigurierbar
+let TOP_K        = 5;    // Anzahl ähnlichster Erinnerungen die als Kontext genutzt werden
+let MIN_SCORE    = 0.65; // Mindestschwelle für Cosine Similarity
+let SEARCH_LIMIT = 200;  // Wie viele DB-Zeilen max. per Suche geladen werden
 
 // ── Init ───────────────────────────────────────────────────────────────────
 async function init(cfg, logFn) {
     if (logFn) log = logFn;
-    ollamaHost = cfg.ollamaHost || ollamaHost;
-    embedModel = cfg.embedModel || embedModel;
+    ollamaHost   = cfg.ollamaHost   || ollamaHost;
+    embedModel   = cfg.embedModel   || embedModel;
+    if (cfg.topK        > 0)   TOP_K        = cfg.topK;
+    if (cfg.minScore    >= 0)  MIN_SCORE    = cfg.minScore;
+    if (cfg.searchLimit > 0)   SEARCH_LIMIT = cfg.searchLimit;
     lastCfg = { ...cfg };
 
     if (initPromise) return initPromise;
@@ -149,11 +154,11 @@ async function search(query, sessionId) {
     try {
         const queryVec = await getEmbedding(query);
 
-        // Letzte 200 Einträge laden (nicht aktuelle Session für Diversität)
+        // Letzte SEARCH_LIMIT Einträge laden (nicht aktuelle Session für Diversität)
         const [rows] = await pool.execute(
             `SELECT role, content, embedding FROM memories
-             WHERE session_id != ? ORDER BY created_at DESC LIMIT 200`,
-            [sessionId]
+             WHERE session_id != ? ORDER BY created_at DESC LIMIT ?`,
+            [sessionId, SEARCH_LIMIT]
         );
 
         const scored = rows.map(row => {
