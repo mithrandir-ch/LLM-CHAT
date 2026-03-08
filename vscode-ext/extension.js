@@ -18,8 +18,14 @@ function readEnv(root) {
     try {
         const lines = fs.readFileSync(path.join(root, '.env'), 'utf8').split('\n');
         for (const l of lines) {
-            const m = l.match(/^\s*([^#=]+?)\s*=\s*(.+?)\s*$/);
-            if (m) env[m[1].trim()] = m[2].trim();
+            const m = l.match(/^\s*([^#=]+?)\s*=\s*(.*)\s*$/);
+            if (m) {
+                let v = m[2].trim();
+                if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith('\'') && v.endsWith('\''))) {
+                    v = v.slice(1, -1);
+                }
+                env[m[1].trim()] = v;
+            }
         }
     } catch { /* .env optional */ }
     if (env.OLLAMA_HOST)  { ollamaHost = env.OLLAMA_HOST; log(`[llm-chat] OLLAMA_HOST=${ollamaHost}`); }
@@ -181,6 +187,15 @@ textarea:focus{outline:none;border-color:var(--vscode-focusBorder)}
 <div id="bar">
   <select id="model"><option>Lädt…</option></select>
   <span id="stats"></span>
+  <button id="btn-status" title="Status anzeigen" style="background:none;border:none;color:var(--vscode-foreground);cursor:pointer;font-size:14px;opacity:.6;padding:0 4px;flex-shrink:0">⚡</button>
+</div>
+<div id="status-overlay" style="display:none;position:absolute;top:36px;right:0;left:0;z-index:99;background:var(--vscode-editorWidget-background,#252526);border:1px solid var(--vscode-panel-border);border-top:none;padding:10px 12px;font-size:11.5px;line-height:1.7">
+  <div style="font-weight:700;margin-bottom:6px;font-size:12px">System-Status</div>
+  <div id="st-ollama"></div>
+  <div id="st-db"></div>
+  <div id="st-rows"></div>
+  <div id="st-model" style="color:var(--vscode-descriptionForeground);margin-top:4px"></div>
+  <button id="st-close" style="margin-top:8px;width:100%;padding:3px;background:var(--vscode-button-secondaryBackground,#3c3c3c);color:var(--vscode-button-secondaryForeground,#ccc);border:none;border-radius:3px;cursor:pointer;font-size:11px">Schliessen</button>
 </div>
 <div id="tabs-wrap">
   <div id="tabs"></div>
@@ -249,6 +264,14 @@ class ChatProvider {
                 } catch (e) {
                     view.webview.postMessage({ type: 'err', rid: msg.rid, msg: e.message });
                 }
+                return;
+            }
+
+            if (msg.type === 'status') {
+                const mem = await memory.getStatus();
+                let ollamaOk = false;
+                try { await get(`${ollamaHost}/api/tags`); ollamaOk = true; } catch {}
+                view.webview.postMessage({ type: 'status-result', mem, ollamaOk, ollamaHost });
                 return;
             }
 
@@ -327,7 +350,7 @@ function activate(ctx) {
             dbHost:     env.DB_HOST,
             dbPort:     parseInt(env.DB_PORT || '3306'),
             dbUser:     env.DB_USER,
-            dbPass:     env.DB_PASS,
+            dbPass:     env.DB_PASSWORD,
             dbName:     env.DB_NAME,
         }, m => { out.appendLine(m); console.log(m); }).then(ok => {
             log(ok ? '[memory] Langzeitgedächtnis aktiv' : '[memory] Deaktiviert (kein DB-Zugang)');

@@ -18,41 +18,66 @@ let pool        = null;
 let ollamaHost  = 'http://192.168.1.146:11434';
 let embedModel  = 'nomic-embed-text';
 let log         = console.log;
+let lastCfg     = null;
+let lastError   = null;
+let initPromise = null;
 
 const TOP_K     = 5;    // Anzahl ähnlichster Erinnerungen die als Kontext genutzt werden
 const MIN_SCORE = 0.65; // Mindestschwelle für Cosine Similarity
 
 // ── Init ───────────────────────────────────────────────────────────────────
 async function init(cfg, logFn) {
-    log = logFn || log;
+    if (logFn) log = logFn;
     ollamaHost = cfg.ollamaHost || ollamaHost;
     embedModel = cfg.embedModel || embedModel;
+    lastCfg = { ...cfg };
 
-    try {
-        pool = mysql.createPool({
-            host:     cfg.dbHost,
-            port:     cfg.dbPort || 3306,
-            user:     cfg.dbUser,
-            password: cfg.dbPass,
-            database: cfg.dbName,
-            waitForConnections: true,
-            connectionLimit: 5,
-            connectTimeout: 5000,
-        });
+    if (initPromise) return initPromise;
 
-        await ensureTable();
-        log(`[memory] DB verbunden: ${cfg.dbHost}:${cfg.dbPort || 3306}/${cfg.dbName}`);
-        return true;
-    } catch (e) {
-        log(`[memory] DB-Verbindung fehlgeschlagen: ${e.message} — Memory deaktiviert`);
-        pool = null;
-        return false;
-    }
+    initPromise = (async () => {
+        let nextPool = null;
+        try {
+            nextPool = mysql.createPool({
+                host:     cfg.dbHost,
+                port:     cfg.dbPort || 3306,
+                user:     cfg.dbUser,
+                password: cfg.dbPass,
+                database: cfg.dbName,
+                waitForConnections: true,
+                connectionLimit: 5,
+                connectTimeout: 5000,
+            });
+
+            // Früher Connect-Test, damit Status echte Verbindungsfehler liefern kann.
+            await nextPool.execute('SELECT 1');
+            await ensureTable(nextPool);
+
+            if (pool && pool !== nextPool) {
+                try { await pool.end(); } catch {}
+            }
+            pool = nextPool;
+            lastError = null;
+            log(`[memory] DB verbunden: ${cfg.dbHost}:${cfg.dbPort || 3306}/${cfg.dbName}`);
+            return true;
+        } catch (e) {
+            lastError = e.message;
+            log(`[memory] DB-Verbindung fehlgeschlagen: ${e.message} — Memory deaktiviert`);
+            if (nextPool) {
+                try { await nextPool.end(); } catch {}
+            }
+            pool = null;
+            return false;
+        } finally {
+            initPromise = null;
+        }
+    })();
+
+    return initPromise;
 }
 
-async function ensureTable() {
+async function ensureTable(targetPool = pool) {
     // Nutzt bestehende 'memories' Tabelle (embedding als JSON-Text)
-    await pool.execute(`
+    await targetPool.execute(`
         CREATE TABLE IF NOT EXISTS memories (
             id         INT AUTO_INCREMENT PRIMARY KEY,
             session_id VARCHAR(64),
@@ -161,4 +186,29 @@ async function buildMemoryContext(userMessage, sessionId) {
     return `Relevante frühere Erinnerungen (zur Orientierung, nicht wörtlich zitieren):\n${lines.join('\n')}`;
 }
 
-module.exports = { init, isReady, store, buildMemoryContext };
+// ── Status ────────────────────────────────────────────────────────────────
+async function getStatus() {
+    if (!pool && lastCfg && !initPromise) {
+        await init(lastCfg, log);
+    }
+
+    if (!pool) {
+        return {
+            connected: false,
+            rows: 0,
+            host: ollamaHost,
+            model: embedModel,
+            error: initPromise ? 'Verbindung wird aufgebaut…' : (lastError || 'nicht verbunden'),
+        };
+    }
+
+    try {
+        const [[{ cnt }]] = await pool.execute('SELECT COUNT(*) AS cnt FROM memories');
+        return { connected: true, rows: cnt, host: ollamaHost, model: embedModel };
+    } catch (e) {
+        lastError = e.message;
+        return { connected: false, rows: 0, host: ollamaHost, model: embedModel, error: e.message };
+    }
+}
+
+module.exports = { init, isReady, store, buildMemoryContext, getStatus };

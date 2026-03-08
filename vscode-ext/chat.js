@@ -19,6 +19,7 @@ window.addEventListener('message', ({ data: m }) => {
         case 'chunk':      { const s = streams[m.rid]; if (s) s.chunk(m.text); break; }
         case 'chat-done':  { const s = streams[m.rid]; if (s) { s.done(m.tokens, m.evalMs); delete streams[m.rid]; } break; }
         case 'chat-error': { const s = streams[m.rid]; if (s) { s.error(m.msg); delete streams[m.rid]; } break; }
+        case 'status-result': onStatusResult(m); break;
     }
 });
 
@@ -217,6 +218,32 @@ function addBubble(role, text) {
     wrap.appendChild(d);
     scrollDown();
     return d;
+}
+
+// ── Status Overlay ─────────────────────────────────────────────────────────
+$('btn-status').addEventListener('click', () => {
+    const ov = $('status-overlay');
+    if (ov.style.display !== 'none') { ov.style.display = 'none'; return; }
+    $('st-ollama').textContent = '⏳ Prüfe…';
+    $('st-db').textContent     = '';
+    $('st-rows').textContent   = '';
+    $('st-model').textContent  = '';
+    ov.style.display = 'block';
+    vs.postMessage({ type: 'status' });
+});
+$('st-close').addEventListener('click', () => { $('status-overlay').style.display = 'none'; });
+
+function onStatusResult({ ollamaOk, ollamaHost, mem }) {
+    $('st-ollama').innerHTML = ollamaOk
+        ? `<span style="color:#81c784">● Ollama</span> <span style="color:var(--vscode-descriptionForeground)">${ollamaHost}</span>`
+        : `<span style="color:#ef5350">✕ Ollama nicht erreichbar</span> <span style="color:var(--vscode-descriptionForeground)">${ollamaHost}</span>`;
+    $('st-db').innerHTML = mem.connected
+        ? `<span style="color:#81c784">● MariaDB</span> <span style="color:var(--vscode-descriptionForeground)">verbunden</span>`
+        : `<span style="color:#ef5350">✕ MariaDB</span> <span style="color:var(--vscode-descriptionForeground)">${mem.error || 'nicht verbunden'}</span>`;
+    $('st-rows').innerHTML = mem.connected
+        ? `<span style="color:var(--vscode-descriptionForeground)">  Erinnerungen gespeichert: <strong>${mem.rows}</strong></span>`
+        : '';
+    $('st-model').textContent = `Embedding-Modell: ${mem.model}`;
 }
 
 function sysMsg(text) {
